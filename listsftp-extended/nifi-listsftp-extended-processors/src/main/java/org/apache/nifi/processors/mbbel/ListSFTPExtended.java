@@ -7,7 +7,6 @@ import org.apache.nifi.annotation.behavior.Stateful;
 import org.apache.nifi.annotation.behavior.TriggerSerially;
 import org.apache.nifi.annotation.behavior.WritesAttribute;
 import org.apache.nifi.annotation.behavior.WritesAttributes;
-import org.apache.nifi.annotation.configuration.DefaultSchedule;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
@@ -38,7 +37,6 @@ import org.apache.nifi.processors.standard.ListFile;
 import org.apache.nifi.processors.standard.PutSFTP;
 import org.apache.nifi.processors.standard.util.FTPTransfer;
 import org.apache.nifi.processors.standard.util.SFTPTransfer;
-import org.apache.nifi.scheduling.SchedulingStrategy;
 import org.apache.nifi.serialization.RecordSetWriter;
 import org.apache.nifi.serialization.RecordSetWriterFactory;
 import org.apache.nifi.serialization.WriteResult;
@@ -76,7 +74,6 @@ import java.util.stream.Collectors;
 @Stateful(scopes = {Scope.CLUSTER}, description = "After performing a listing of files, the timestamp of the newest file is stored. "
         + "This allows the Processor to list only files that have been added or modified after "
         + "this date the next time that the Processor is run. State is stored across the cluster to prevent duplicate listings even when the processor runs on multiple nodes.")
-@DefaultSchedule(strategy = SchedulingStrategy.TIMER_DRIVEN, period = "1 min")
 public class ListSFTPExtended extends ListFileTransfer {
 
     private final ThreadLocal<FlowFile> currentFlowFile = new ThreadLocal<>();
@@ -369,6 +366,7 @@ public class ListSFTPExtended extends ListFileTransfer {
         }
     }
 
+
     /**
      * Wrapper ProcessContext that evaluates property expressions against the incoming FlowFile
      * when available. This allows dynamic properties like ${host.name} to be resolved from
@@ -387,12 +385,12 @@ public class ListSFTPExtended extends ListFileTransfer {
         public PropertyValue getProperty(final PropertyDescriptor descriptor) {
             final PropertyValue delegateValue = delegate.getProperty(descriptor);
             final FlowFile incoming = incomingFlowFile.get();
-            
+
             // If there's an incoming FlowFile, return a wrapper that evaluates expressions against it
             if (incoming != null) {
                 return delegateValue.evaluateAttributeExpressions(incoming);
             }
-            
+
             return delegateValue;
         }
 
@@ -433,12 +431,12 @@ public class ListSFTPExtended extends ListFileTransfer {
 
         @Override
         public boolean hasConnection(Relationship relationship) {
-            return false;
+            return delegate.hasConnection(relationship);
         }
 
         @Override
         public boolean isExpressionLanguagePresent(PropertyDescriptor propertyDescriptor) {
-            return false;
+            return delegate.isExpressionLanguagePresent(propertyDescriptor);
         }
 
         @Override
@@ -448,17 +446,17 @@ public class ListSFTPExtended extends ListFileTransfer {
 
         @Override
         public String getName() {
-            return "";
+            return delegate.getName();
         }
 
         @Override
         public boolean isRelationshipRetried(Relationship relationship) {
-            return false;
+            return delegate.isRelationshipRetried(relationship);
         }
 
         @Override
         public int getRetryCount() {
-            return 0;
+            return delegate.getRetryCount();
         }
 
         @Override
@@ -483,17 +481,17 @@ public class ListSFTPExtended extends ListFileTransfer {
 
         @Override
         public Set<Relationship> getAvailableRelationships() {
-            return Set.of();
+            return delegate.getAvailableRelationships();
         }
 
         @Override
         public boolean isAutoTerminated(Relationship relationship) {
-            return false;
+            return delegate.isAutoTerminated(relationship);
         }
 
         @Override
         public boolean isConnectedToCluster() {
-            return false;
+            return delegate.isConnectedToCluster();
         }
     }
 }
