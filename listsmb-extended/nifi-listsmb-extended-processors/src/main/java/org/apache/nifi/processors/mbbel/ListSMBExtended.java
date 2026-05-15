@@ -6,17 +6,22 @@ import org.apache.nifi.annotation.behavior.Stateful;
 import org.apache.nifi.annotation.behavior.TriggerSerially;
 import org.apache.nifi.annotation.behavior.WritesAttribute;
 import org.apache.nifi.annotation.behavior.WritesAttributes;
+import org.apache.nifi.annotation.configuration.DefaultSchedule;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
+import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.PropertyDescriptor.Builder;
 import org.apache.nifi.components.PropertyValue;
 import org.apache.nifi.components.ValidationContext;
 import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.components.Validator;
 import org.apache.nifi.components.state.Scope;
+import org.apache.nifi.components.state.StateManager;
 import org.apache.nifi.context.PropertyContext;
 import org.apache.nifi.controller.ControllerServiceLookup;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.migration.PropertyConfiguration;
 import org.apache.nifi.processor.DataUnit;
@@ -26,20 +31,28 @@ import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.scheduling.ExecutionNode;
+import org.apache.nifi.scheduling.SchedulingStrategy;
 import org.apache.nifi.processor.util.list.AbstractListProcessor;
 import org.apache.nifi.processor.util.list.ListedEntityTracker;
+import org.apache.nifi.processors.smb.FetchSmb;
+import org.apache.nifi.processors.smb.GetSmbFile;
+import org.apache.nifi.processors.smb.PutSmbFile;
 import org.apache.nifi.processors.smb.util.InitialListingStrategy;
 import org.apache.nifi.serialization.RecordSetWriter;
 import org.apache.nifi.serialization.RecordSetWriterFactory;
 import org.apache.nifi.serialization.WriteResult;
 import org.apache.nifi.serialization.record.RecordSchema;
 import org.apache.nifi.schema.access.SchemaNotFoundException;
+import org.apache.nifi.services.smb.SmbjClientProviderServiceExtended;
 import org.apache.nifi.services.smb.SmbClientProviderService;
 import org.apache.nifi.services.smb.SmbClientService;
 import org.apache.nifi.services.smb.SmbListableEntity;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.net.URI;
 import java.time.Instant;
 import java.time.LocalDateTime;
@@ -74,10 +87,14 @@ import static org.apache.nifi.services.smb.SmbListableEntity.SIZE;
 @TriggerSerially
 @InputRequirement(Requirement.INPUT_ALLOWED)
 @Tags({"samba, smb, cifs, files", "list"})
+@SeeAlso({PutSmbFile.class, GetSmbFile.class, FetchSmb.class, SmbjClientProviderServiceExtended.class})
 @CapabilityDescription("Lists concrete files shared via SMB protocol. " +
         "Each listed file may result in one FlowFile, the metadata being written as FlowFile attributes. " +
         "Or - in case the 'Record Writer' property is set - the entire result is written as records to a single FlowFile. " +
-        "This processor can optionally accept incoming FlowFiles as trigger signals without consuming the incoming FlowFiles.")
+        "Optional incoming FlowFiles can drive scheduling and Expression Language on properties. Trigger attributes are " +
+        "copied onto each emitted listing FlowFile; listing attributes take precedence when names overlap. " +
+        "The trigger FlowFile is removed so it is not emitted again with listing results. " +
+        "When a Record Writer is configured, a zero-record FlowFile is routed to No Files only when the remote directory has no entries.")
 @WritesAttributes({
         @WritesAttribute(attribute = FILENAME, description = "The name of the file that was read from filesystem."),
         @WritesAttribute(attribute = SHORT_NAME, description = "The short name of the file that was read from filesystem."),
@@ -103,13 +120,17 @@ import static org.apache.nifi.services.smb.SmbListableEntity.SIZE;
 })
 @Stateful(scopes = {Scope.CLUSTER}, description =
         "After performing a listing of files, the state of the previous listing can be stored in order to list files "
-                + "continuously without duplication. State is stored across the cluster so the processor can run on "
-                + "all nodes without duplicate listings when listing strategies require coordination."
+                + "continuously without duplication."
 )
 public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
 
-    private final ThreadLocal<FlowFile> currentFlowFile = new ThreadLocal<>();
-    private volatile Predicate<SmbListableEntity> fileFilter;
+    /**
+     * Snapshot of the last trigger FlowFile's attributes for EL during listing and for copying onto emitted FlowFiles. Cleared in {@code finally}.
+     * The trigger FlowFile itself is removed before listing so {@link AbstractListProcessor} internal {@code commitAsync} does not fail validation.
+     */
+    private final ThreadLocal<Map<String, String>> triggerFlowAttributes = new ThreadLocal<>();
+    /** Set when {@link #performListing} fails during execution; parent swallows {@link IOException}. */
+    private final ThreadLocal<Exception> listingFailure = new ThreadLocal<>();
 
     public static final PropertyDescriptor DIRECTORY = new PropertyDescriptor.Builder()
             .name("Input Directory")
@@ -120,6 +141,7 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
                     + "directory separators.")
             .required(false)
             .addValidator(NON_BLANK_VALIDATOR)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
     public static final PropertyDescriptor MINIMUM_AGE = new PropertyDescriptor.Builder()
@@ -157,7 +179,7 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
             .allowableValues(BY_ENTITIES, NO_TRACKING, BY_TIMESTAMPS)
             .build();
 
-    public static final PropertyDescriptor INITIAL_LISTING_STRATEGY = new PropertyDescriptor.Builder()
+    public static final PropertyDescriptor INITIAL_LISTING_STRATEGY = new Builder()
             .name("Initial Listing Strategy")
             .description("Specifies how to handle existing files on the SMB share when the processor is started for the first time (or its state has been cleared).")
             .required(true)
@@ -166,7 +188,7 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
             .dependsOn(SMB_LISTING_STRATEGY, BY_TIMESTAMPS)
             .build();
 
-    public static final PropertyDescriptor INITIAL_LISTING_TIMESTAMP = new PropertyDescriptor.Builder()
+    public static final PropertyDescriptor INITIAL_LISTING_TIMESTAMP = new Builder()
             .name("Initial Listing Timestamp")
             .description("The timestamp from which the files will be listed when the processor is started for the first time (or its state has been cleared). " +
                     "The value can be specified as an epoch timestamp in milliseconds or as a UTC datetime in a format such as 2025-02-01T00:00:00Z")
@@ -175,30 +197,32 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
             .addValidator(NON_BLANK_VALIDATOR)
             .build();
 
-    public static final PropertyDescriptor SMB_CLIENT_PROVIDER_SERVICE = new PropertyDescriptor.Builder()
+    public static final PropertyDescriptor SMB_CLIENT_PROVIDER_SERVICE = new Builder()
             .name("SMB Client Provider Service")
             .description("Specifies the SMB client provider to use for creating SMB connections.")
             .required(true)
             .identifiesControllerService(SmbClientProviderService.class)
             .build();
 
-    public static final PropertyDescriptor FILE_FILTER = new PropertyDescriptor.Builder()
+    public static final PropertyDescriptor FILE_FILTER = new Builder()
             .name("File Filter")
             .description("Only files whose names match the given regular expression will be listed.")
             .required(false)
             .addValidator(NON_BLANK_VALIDATOR)
             .addValidator(StandardValidators.REGULAR_EXPRESSION_VALIDATOR)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
-    public static final PropertyDescriptor PATH_FILTER = new PropertyDescriptor.Builder()
+    public static final PropertyDescriptor PATH_FILTER = new Builder()
             .name("Path Filter")
             .description("Only files whose paths (up to the file's parent directory) match the given regular expression will be listed.")
             .required(false)
             .addValidator(NON_BLANK_VALIDATOR)
             .addValidator(StandardValidators.REGULAR_EXPRESSION_VALIDATOR)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
-    public static final PropertyDescriptor IGNORE_FILES_WITH_SUFFIX = new PropertyDescriptor.Builder()
+    public static final PropertyDescriptor IGNORE_FILES_WITH_SUFFIX = new Builder()
             .name("Ignore Files with Suffix")
             .description("Files ending with the given suffix will be omitted. Can be used to make sure that files "
                     + "that are still uploading are not listed multiple times, by having those files have a suffix "
@@ -209,17 +233,17 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
             .addValidator(new MustNotContainDirectorySeparatorsValidator())
             .build();
 
-    public static final PropertyDescriptor TRACKING_STATE_CACHE = new PropertyDescriptor.Builder()
+    public static final PropertyDescriptor TRACKING_STATE_CACHE = new Builder()
             .fromPropertyDescriptor(ListedEntityTracker.TRACKING_STATE_CACHE)
             .dependsOn(SMB_LISTING_STRATEGY, BY_ENTITIES)
             .build();
 
-    public static final PropertyDescriptor TRACKING_TIME_WINDOW = new PropertyDescriptor.Builder()
+    public static final PropertyDescriptor TRACKING_TIME_WINDOW = new Builder()
             .fromPropertyDescriptor(ListedEntityTracker.TRACKING_TIME_WINDOW)
             .dependsOn(SMB_LISTING_STRATEGY, BY_ENTITIES)
             .build();
 
-    public static final PropertyDescriptor INITIAL_LISTING_TARGET = new PropertyDescriptor.Builder()
+    public static final PropertyDescriptor INITIAL_LISTING_TARGET = new Builder()
             .fromPropertyDescriptor(ListedEntityTracker.INITIAL_LISTING_TARGET)
             .dependsOn(SMB_LISTING_STRATEGY, BY_ENTITIES)
             .build();
@@ -250,9 +274,14 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
             .autoTerminateDefault(true)
             .build();
 
+    public static final Relationship REL_NO_FILES = new Relationship.Builder()
+            .name("No Files")
+            .description("A zero-record FlowFile when the remote directory has no file entries after listing (requires Record Writer).")
+            .build();
+
     @Override
     public Set<Relationship> getRelationships() {
-        return Set.of(REL_FAILURE, REL_SUCCESS);
+        return Set.of(REL_FAILURE, REL_NO_FILES, REL_SUCCESS);
     }
 
     private volatile Long initialListingTimestamp;
@@ -279,7 +308,6 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
     public void onScheduled(ProcessContext context) throws IOException {
         boolean isStateEmpty = context.getStateManager().getState(getStateScope(context)).toMap().isEmpty();
         initialListingTimestamp = isStateEmpty ? getInitialListingTimestamp(context) : null;
-        fileFilter = createFileFilter(context, null);
     }
 
     @Override
@@ -304,6 +332,7 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
     @Override
     protected Map<String, String> createAttributes(SmbListableEntity entity, ProcessContext context) {
         final Map<String, String> attributes = new TreeMap<>();
+        copyTriggerAttributes(attributes);
         final SmbClientProviderService clientProviderService =
                 context.getProperty(SMB_CLIENT_PROVIDER_SERVICE).asControllerService(SmbClientProviderService.class);
         attributes.put(FILENAME, entity.getName());
@@ -332,7 +361,7 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
     protected List<SmbListableEntity> performListing(ProcessContext context, Long minimumTimestampOrNull,
             ListingMode listingMode) throws IOException {
 
-        final Predicate<SmbListableEntity> filePredicate = listingMode == ListingMode.EXECUTION ? this.fileFilter : createFileFilter(context, minimumTimestampOrNull);
+        final Predicate<SmbListableEntity> filePredicate = createFileFilter(context, minimumTimestampOrNull);
 
         try (Stream<SmbListableEntity> listing = performListing(context)) {
             final Iterator<SmbListableEntity> iterator = listing.iterator();
@@ -348,6 +377,9 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
             }
             return result;
         } catch (Exception e) {
+            if (listingMode == ListingMode.EXECUTION) {
+                listingFailure.set(e);
+            }
             throw new IOException("Could not perform listing", e);
         }
     }
@@ -395,61 +427,61 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
                 context.yield();
                 return;
             }
+
+            if (incoming != null) {
+                triggerFlowAttributes.set(new HashMap<>(incoming.getAttributes()));
+                // Clear the trigger from the session before listing (parent may commitAsync); EL uses the attribute snapshot.
+                session.remove(incoming);
+            }
         }
 
-        currentFlowFile.set(incoming);
-
         try {
-            final ProcessContext listingContext = incoming != null
-                    ? new FlowFileAwareProcessContext(context, currentFlowFile)
+            SmbjClientProviderServiceExtended.setEvaluationAttributes(triggerFlowAttributes.get());
+
+            final ProcessContext listingContext = triggerFlowAttributes.get() != null
+                    ? new FlowFileAwareProcessContext(context, triggerFlowAttributes)
                     : context;
-            // Parent listing uses listingContext so DIRECTORY and other properties can use EL from the incoming FlowFile.
-            super.onTrigger(listingContext, session);
+            final ProcessSession listingSession = withTriggerAttributes(session, triggerFlowAttributes.get());
+            // Parent may commitAsync mid-run; trigger FlowFile must not remain in this session (see onTrigger javadoc).
+            super.onTrigger(listingContext, listingSession);
+
+            final Exception listingError = listingFailure.get();
+            if (listingError != null) {
+                listingFailure.remove();
+                final FlowFile errorFlowFile = createErrorFlowFile(listingSession, contextForErrorAttributes(context), listingError);
+                if (errorFlowFile != null) {
+                    listingSession.transfer(errorFlowFile, REL_FAILURE);
+                }
+                return;
+            }
 
             // Emit an empty FlowFile for empty directories if applicable
-            emitEmptyFlowFileIfNeeded(listingContext, session, incoming);
-
-            // If there's an incoming FlowFile, transfer it to success on successful operations
-            if (incoming != null) {
-                session.transfer(incoming, REL_SUCCESS);
-            }
+            emitEmptyFlowFileIfNeeded(listingContext, listingSession);
         } catch (final Exception e) {
             getLogger().error("Failed to perform SMB listing or handle FlowFiles due to: {}", e.getMessage(), e);
 
-            // Create and emit an error FlowFile
-            FlowFile errorFlowFile = createErrorFlowFile(session, contextForErrorAttributes(context, incoming), incoming, e);
-
+            final ProcessSession listingSession = withTriggerAttributes(session, triggerFlowAttributes.get());
+            final FlowFile errorFlowFile = createErrorFlowFile(listingSession, contextForErrorAttributes(context), e);
             if (errorFlowFile != null) {
-                session.transfer(errorFlowFile, REL_FAILURE);
-            }
-
-            // Transfer the incoming FlowFile (if available) to failure
-            if (incoming != null) {
-                session.transfer(incoming, REL_FAILURE);
+                listingSession.transfer(errorFlowFile, REL_FAILURE);
             }
         } finally {
-            currentFlowFile.remove();
+            listingFailure.remove();
+            SmbjClientProviderServiceExtended.clearEvaluationAttributes();
+            triggerFlowAttributes.remove();
         }
     }
 
     private FlowFile createErrorFlowFile(final ProcessSession session,
                                          final ProcessContext context,
-                                         final FlowFile incoming,
                                          final Exception error) {
-        FlowFile errorFlowFile;
-
-        if (incoming != null) {
-            // Clone the incoming FlowFile to preserve metadata if applicable
-            errorFlowFile = session.create(incoming);
-        } else {
-            // Create a new FlowFile if no incoming one exists
-            errorFlowFile = session.create();
-        }
+        FlowFile errorFlowFile = session.create();
 
         // Add error-specific attributes
         final Map<String, String> attributes = new HashMap<>();
-        attributes.put("error.message", error.getMessage());
-        attributes.put("error.class", error.getClass().getName());
+        final Throwable rootCause = getRootCause(error);
+        attributes.put("error.message", rootCause.getMessage() != null ? rootCause.getMessage() : error.getMessage());
+        attributes.put("error.class", rootCause.getClass().getName());
         final SmbClientProviderService clientProviderService =
                 context.getProperty(SMB_CLIENT_PROVIDER_SERVICE).asControllerService(SmbClientProviderService.class);
         attributes.put("smb.service.location", clientProviderService.getServiceLocation().toString());
@@ -462,13 +494,54 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
         return errorFlowFile;
     }
 
-    private ProcessContext contextForErrorAttributes(final ProcessContext context, final FlowFile incoming) {
-        return incoming != null ? new FlowFileAwareProcessContext(context, currentFlowFile) : context;
+    private void copyTriggerAttributes(final Map<String, String> attributes) {
+        final Map<String, String> triggerAttrs = triggerFlowAttributes.get();
+        if (triggerAttrs != null && !triggerAttrs.isEmpty()) {
+            attributes.putAll(triggerAttrs);
+        }
+    }
+
+    private static ProcessSession withTriggerAttributes(final ProcessSession session,
+                                                        final Map<String, String> triggerAttributes) {
+        if (triggerAttributes == null || triggerAttributes.isEmpty()) {
+            return session;
+        }
+
+        final InvocationHandler handler = new InvocationHandler() {
+            @Override
+            public Object invoke(final Object proxy, final Method method, final Object[] args) throws Throwable {
+                if ("putAllAttributes".equals(method.getName()) && args != null && args.length == 2 && args[1] instanceof Map) {
+                    @SuppressWarnings("unchecked")
+                    final Map<String, String> merged = new HashMap<>(triggerAttributes);
+                    merged.putAll((Map<String, String>) args[1]);
+                    args[1] = merged;
+                }
+                return method.invoke(session, args);
+            }
+        };
+
+        return (ProcessSession) Proxy.newProxyInstance(
+                ProcessSession.class.getClassLoader(),
+                new Class<?>[] {ProcessSession.class},
+                handler);
+    }
+
+    private ProcessContext contextForErrorAttributes(final ProcessContext context) {
+        return triggerFlowAttributes.get() != null
+                ? new FlowFileAwareProcessContext(context, triggerFlowAttributes)
+                : context;
+    }
+
+    private static Throwable getRootCause(final Throwable throwable) {
+        Throwable rootCause = throwable;
+        while (rootCause.getCause() != null) {
+            rootCause = rootCause.getCause();
+        }
+        return rootCause;
     }
 
     private void emitEmptyFlowFileIfNeeded(final ProcessContext context,
-                                           final ProcessSession session,
-                                           final FlowFile incoming) {
+                                           final ProcessSession session) {
 
         final RecordSetWriterFactory writerFactory = context.getProperty(RECORD_WRITER)
                 .asControllerService(RecordSetWriterFactory.class);
@@ -481,14 +554,13 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
 
         List<SmbListableEntity> listing;
         try {
-            listing = performListing(context, null, ListingMode.EXECUTION);
+            final Integer entryCount = countUnfilteredListing(context);
+            if (entryCount == null || entryCount > 0) {
+                return;
+            }
         } catch (final IOException e) {
             getLogger().warn("Could not re-check listing for empty-state detection: {}", e.getMessage());
             return;
-        }
-
-        if (!listing.isEmpty()) {
-            return; // Directory is not empty; do nothing
         }
 
         FlowFile emptyFlowFile = session.create();
@@ -517,8 +589,8 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
 
             emptyFlowFile = session.putAllAttributes(emptyFlowFile, attributes);
 
-            session.transfer(emptyFlowFile, REL_SUCCESS);
-            getLogger().debug("Emitted zero-record FlowFile to indicate empty SMB directory.");
+            session.transfer(emptyFlowFile, REL_NO_FILES);
+            getLogger().debug("Emitted zero-record FlowFile to No Files for empty SMB directory.");
         } catch (final Exception e) {
             getLogger().error("Failed to write empty listing FlowFile due to an error.", e);
             session.remove(emptyFlowFile);
@@ -655,23 +727,23 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
 
     /**
      * Delegates to the real {@link ProcessContext} but evaluates property expressions against the
-     * incoming FlowFile when present (same thread as {@link #currentFlowFile}).
+     * trigger attribute snapshot when present (same thread as {@link ListSMBExtended#triggerFlowAttributes}).
      */
     private static class FlowFileAwareProcessContext implements ProcessContext {
         private final ProcessContext delegate;
-        private final ThreadLocal<FlowFile> incomingFlowFile;
+        private final ThreadLocal<Map<String, String>> attributeSnapshot;
 
-        FlowFileAwareProcessContext(final ProcessContext delegate, final ThreadLocal<FlowFile> incomingFlowFile) {
+        FlowFileAwareProcessContext(final ProcessContext delegate, final ThreadLocal<Map<String, String>> attributeSnapshot) {
             this.delegate = delegate;
-            this.incomingFlowFile = incomingFlowFile;
+            this.attributeSnapshot = attributeSnapshot;
         }
 
         @Override
         public PropertyValue getProperty(final PropertyDescriptor descriptor) {
             final PropertyValue delegateValue = delegate.getProperty(descriptor);
-            final FlowFile incoming = incomingFlowFile.get();
-            if (incoming != null) {
-                return delegateValue.evaluateAttributeExpressions(incoming);
+            final Map<String, String> attrs = attributeSnapshot.get();
+            if (attrs != null && !attrs.isEmpty()) {
+                return delegateValue.evaluateAttributeExpressions(attrs);
             }
             return delegateValue;
         }
@@ -778,5 +850,3 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
     }
 
 }
-
-

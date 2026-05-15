@@ -45,6 +45,9 @@ import org.apache.nifi.schema.access.SchemaNotFoundException;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.Method;
+import java.lang.reflect.Proxy;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
@@ -55,7 +58,10 @@ import java.util.stream.Collectors;
 @Tags({"list", "sftp", "remote", "ingest", "source", "input", "files"})
 @CapabilityDescription("Performs a listing of the files residing on an SFTP server. For each file that is found on the remote server, a new FlowFile will be created with the filename attribute "
         + "set to the name of the file on the remote server. This can then be used in conjunction with FetchSFTP in order to fetch those files. "
-        + "This processor can optionally accept incoming FlowFiles as trigger signals without consuming the incoming FlowFiles.")
+        + "This processor can optionally accept incoming FlowFiles as trigger signals. Trigger attributes are used for "
+        + "Expression Language and are copied onto each emitted listing FlowFile; listing attributes take precedence when names overlap. "
+        + "The trigger FlowFile is removed so it is not emitted again with listing results. "
+        + "When a Record Writer is configured, a zero-record FlowFile is routed to No Files only when the remote directory has no file entries.")
 @SeeAlso({FetchSFTP.class, GetSFTP.class, PutSFTP.class})
 @WritesAttributes({
         @WritesAttribute(attribute = "sftp.remote.host", description = "The hostname of the SFTP Server"),
@@ -76,15 +82,23 @@ import java.util.stream.Collectors;
         + "this date the next time that the Processor is run. State is stored across the cluster to prevent duplicate listings even when the processor runs on multiple nodes.")
 public class ListSFTPExtended extends ListFileTransfer {
 
-    private final ThreadLocal<FlowFile> currentFlowFile = new ThreadLocal<>();
+    /**
+     * Snapshot of the last trigger FlowFile's attributes for EL during listing and for copying onto emitted FlowFiles. Cleared in {@code finally}.
+     */
+    private final ThreadLocal<Map<String, String>> triggerFlowAttributes = new ThreadLocal<>();
     private volatile Predicate<FileInfo> fileFilter;
+
+    public static final PropertyDescriptor PASSWORD = new PropertyDescriptor.Builder()
+            .fromPropertyDescriptor(SFTPTransfer.PASSWORD)
+            .sensitive(false)
+            .build();
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
             FILE_TRANSFER_LISTING_STRATEGY,
             SFTPTransfer.HOSTNAME,
             SFTPTransfer.PORT,
             SFTPTransfer.USERNAME,
-            SFTPTransfer.PASSWORD,
+            PASSWORD,
             SFTPTransfer.PRIVATE_KEY_PATH,
             SFTPTransfer.PRIVATE_KEY_PASSPHRASE,
             REMOTE_PATH,
@@ -118,15 +132,21 @@ public class ListSFTPExtended extends ListFileTransfer {
 
 
     public static final Relationship REL_FAILURE = new Relationship.Builder()
-            .name("failure")
+            .name("Failure")
             .description("Failed processing")
             .autoTerminateDefault(true)
+            .build();
+
+    public static final Relationship REL_NO_FILES = new Relationship.Builder()
+            .name("No Files")
+            .description("A zero-record FlowFile when the remote directory has no file entries after listing (requires Record Writer).")
             .build();
 
     @Override
     public Set<Relationship> getRelationships() {
         return new HashSet<>() {{
             add(REL_FAILURE);
+            add(REL_NO_FILES);
             add(REL_SUCCESS);
         }};
     }
@@ -150,14 +170,21 @@ public class ListSFTPExtended extends ListFileTransfer {
 
     @Override
     protected FileTransfer getFileTransfer(final ProcessContext context) {
-        // Wrap the context to evaluate expressions against the incoming FlowFile
-        final ProcessContext wrappedContext = new FlowFileAwareProcessContext(context, currentFlowFile);
+        final ProcessContext wrappedContext = new FlowFileAwareProcessContext(context, triggerFlowAttributes);
         return new SFTPTransfer(wrappedContext, getLogger());
     }
 
     @Override
     protected String getProtocolName() {
         return "sftp";
+    }
+
+    @Override
+    protected Map<String, String> createAttributes(final FileInfo fileInfo, final ProcessContext context) {
+        final Map<String, String> attributes = new HashMap<>();
+        copyTriggerAttributes(attributes);
+        attributes.putAll(super.createAttributes(fileInfo, context));
+        return attributes;
     }
 
     @Override
@@ -231,107 +258,121 @@ public class ListSFTPExtended extends ListFileTransfer {
         if (context.hasIncomingConnection()) {
             incoming = session.get();
 
-            // If there's no incoming FlowFile (non-loop connections), yield the processor
             if (incoming == null && context.hasNonLoopConnection()) {
                 context.yield();
                 return;
             }
+
+            if (incoming != null) {
+                triggerFlowAttributes.set(new HashMap<>(incoming.getAttributes()));
+                session.remove(incoming);
+                incoming = null;
+            }
         }
 
-        currentFlowFile.set(incoming);
-
         try {
-            // Call the parent `onTrigger` for the primary SFTP listing behavior
-            super.onTrigger(context, session);
+            final ProcessSession listingSession = withTriggerAttributes(session, triggerFlowAttributes.get());
+            super.onTrigger(context, listingSession);
 
-            // Emit an empty FlowFile for empty directories if applicable
-            emitEmptyFlowFileIfNeeded(context, session, incoming);
-
-            // If there’s an incoming FlowFile, transfer it to success on successful operations
-            if (incoming != null) {
-                session.transfer(incoming, REL_SUCCESS);
-            }
+            emitEmptyFlowFileIfNeeded(context, listingSession);
         } catch (final Exception e) {
             getLogger().error("Failed to perform SFTP listing or handle FlowFiles due to: {}", e.getMessage(), e);
 
-            // Create and emit an error FlowFile
-            FlowFile errorFlowFile = createErrorFlowFile(session, context, incoming, e);
-
+            final ProcessSession listingSession = withTriggerAttributes(session, triggerFlowAttributes.get());
+            final FlowFile errorFlowFile = createErrorFlowFile(listingSession, context, e);
             if (errorFlowFile != null) {
-                session.transfer(errorFlowFile, REL_FAILURE);
-            }
-
-            // Transfer the incoming FlowFile (if available) to failure
-            if (incoming != null) {
-                session.transfer(incoming, REL_FAILURE);
+                listingSession.transfer(errorFlowFile, REL_FAILURE);
             }
         } finally {
-            currentFlowFile.remove();
+            triggerFlowAttributes.remove();
         }
     }
 
     private FlowFile createErrorFlowFile(final ProcessSession session,
                                          final ProcessContext context,
-                                         final FlowFile incoming,
                                          final Exception error) {
-        FlowFile errorFlowFile;
+        FlowFile errorFlowFile = session.create();
 
-        if (incoming != null) {
-            // Clone the incoming FlowFile to preserve metadata if applicable
-            errorFlowFile = session.create(incoming);
-        } else {
-            // Create a new FlowFile if no incoming one exists
-            errorFlowFile = session.create();
-        }
-
-        // Add error-specific attributes
         final Map<String, String> attributes = new HashMap<>();
         attributes.put("error.message", error.getMessage());
         attributes.put("error.class", error.getClass().getName());
+        final Map<String, String> elAttributes = triggerFlowAttributes.get() != null ? triggerFlowAttributes.get() : Map.of();
         attributes.put("sftp.remote.host", context.getProperty(SFTPTransfer.HOSTNAME)
-                .evaluateAttributeExpressions(incoming).getValue());
+                .evaluateAttributeExpressions(elAttributes).getValue());
         attributes.put("sftp.remote.port", context.getProperty(SFTPTransfer.PORT)
-                .evaluateAttributeExpressions(incoming).getValue());
+                .evaluateAttributeExpressions(elAttributes).getValue());
         attributes.put("sftp.listing.user", context.getProperty(SFTPTransfer.USERNAME)
-                .evaluateAttributeExpressions(incoming).getValue());
+                .evaluateAttributeExpressions(elAttributes).getValue());
 
         errorFlowFile = session.putAllAttributes(errorFlowFile, attributes);
 
-        getLogger().info("Created error FlowFile with attributes: {}", attributes);
+        getLogger().debug("Created error FlowFile with attributes: {}", attributes);
 
         return errorFlowFile;
     }
 
+    private void copyTriggerAttributes(final Map<String, String> attributes) {
+        final Map<String, String> triggerAttrs = triggerFlowAttributes.get();
+        if (triggerAttrs != null && !triggerAttrs.isEmpty()) {
+            attributes.putAll(triggerAttrs);
+        }
+    }
+
+    private static ProcessSession withTriggerAttributes(final ProcessSession session,
+                                                        final Map<String, String> triggerAttributes) {
+        if (triggerAttributes == null || triggerAttributes.isEmpty()) {
+            return session;
+        }
+
+        final InvocationHandler handler = new InvocationHandler() {
+            @Override
+            public Object invoke(final Object proxy, final Method method, final Object[] args) throws Throwable {
+                if ("putAllAttributes".equals(method.getName()) && args != null && args.length == 2 && args[1] instanceof Map) {
+                    @SuppressWarnings("unchecked")
+                    final Map<String, String> merged = new HashMap<>(triggerAttributes);
+                    merged.putAll((Map<String, String>) args[1]);
+                    args[1] = merged;
+                }
+                return method.invoke(session, args);
+            }
+        };
+
+        return (ProcessSession) Proxy.newProxyInstance(
+                ProcessSession.class.getClassLoader(),
+                new Class<?>[] {ProcessSession.class},
+                handler);
+    }
+
     private void emitEmptyFlowFileIfNeeded(final ProcessContext context,
-                                           final ProcessSession session,
-                                           final FlowFile incoming) {
+                                           final ProcessSession session) {
 
         final RecordSetWriterFactory writerFactory = context.getProperty(RECORD_WRITER)
                 .asControllerService(RecordSetWriterFactory.class);
 
-        // If no writer factory, skip processing
         if (writerFactory == null) {
             getLogger().debug("No Record Writer Factory configured; skipping emission for empty directory.");
             return;
         }
 
-        List<FileInfo> listing;
         try {
-            listing = performListing(context, null, ListingMode.EXECUTION, true);
+            final List<FileInfo> listing = performListing(context, null, ListingMode.EXECUTION, false);
+            final boolean hasFileEntries = listing.stream().anyMatch(info -> !info.isDirectory());
+            if (hasFileEntries) {
+                return;
+            }
         } catch (final IOException e) {
             getLogger().warn("Could not re-check listing for empty-state detection: {}", e.getMessage());
             return;
         }
 
-        if (!listing.isEmpty()) {
-            return; // Directory is not empty; do nothing
-        }
-
         FlowFile emptyFlowFile = session.create();
         final Map<String, String> attributes = new HashMap<>();
+        final Map<String, String> elAttributes = triggerFlowAttributes.get() != null
+                ? triggerFlowAttributes.get()
+                : Map.of();
 
         try {
-            final RecordSchema schema = getRecordSchema(); // Custom method to fetch schema
+            final RecordSchema schema = getRecordSchema();
 
             emptyFlowFile = session.write(emptyFlowFile, (final OutputStream out) -> {
                 try (final RecordSetWriter writer =
@@ -345,58 +386,51 @@ public class ListSFTPExtended extends ListFileTransfer {
                 }
             });
 
-            // Populate attributes for logging/debugging
             attributes.put("sftp.remote.host",
                     context.getProperty(SFTPTransfer.HOSTNAME)
-                            .evaluateAttributeExpressions(incoming).getValue());
+                            .evaluateAttributeExpressions(elAttributes).getValue());
             attributes.put("sftp.remote.port",
                     context.getProperty(SFTPTransfer.PORT)
-                            .evaluateAttributeExpressions(incoming).getValue());
+                            .evaluateAttributeExpressions(elAttributes).getValue());
             attributes.put("sftp.listing.user",
                     context.getProperty(SFTPTransfer.USERNAME)
-                            .evaluateAttributeExpressions(incoming).getValue());
+                            .evaluateAttributeExpressions(elAttributes).getValue());
 
             emptyFlowFile = session.putAllAttributes(emptyFlowFile, attributes);
 
-            session.transfer(emptyFlowFile, REL_SUCCESS);
-            getLogger().info("Emitted zero-record FlowFile to indicate empty SFTP directory.");
+            session.transfer(emptyFlowFile, REL_NO_FILES);
+            getLogger().debug("Emitted zero-record FlowFile to No Files for empty SFTP directory.");
         } catch (final Exception e) {
             getLogger().error("Failed to write empty listing FlowFile due to an error.", e);
             session.remove(emptyFlowFile);
         }
     }
 
-
-    /**
-     * Wrapper ProcessContext that evaluates property expressions against the incoming FlowFile
-     * when available. This allows dynamic properties like ${host.name} to be resolved from
-     * incoming FlowFile attributes.
-     */
     private static class FlowFileAwareProcessContext implements ProcessContext {
         private final ProcessContext delegate;
-        private final ThreadLocal<FlowFile> incomingFlowFile;
+        private final ThreadLocal<Map<String, String>> attributeSnapshot;
 
-        FlowFileAwareProcessContext(final ProcessContext delegate, final ThreadLocal<FlowFile> incomingFlowFile) {
+        FlowFileAwareProcessContext(final ProcessContext delegate, final ThreadLocal<Map<String, String>> attributeSnapshot) {
             this.delegate = delegate;
-            this.incomingFlowFile = incomingFlowFile;
+            this.attributeSnapshot = attributeSnapshot;
         }
 
         @Override
         public PropertyValue getProperty(final PropertyDescriptor descriptor) {
-            final PropertyValue delegateValue = delegate.getProperty(descriptor);
-            final FlowFile incoming = incomingFlowFile.get();
-
-            // If there's an incoming FlowFile, return a wrapper that evaluates expressions against it
-            if (incoming != null) {
-                return delegateValue.evaluateAttributeExpressions(incoming);
+            final PropertyDescriptor resolvedDescriptor = PASSWORD.getName().equals(descriptor.getName())
+                    ? PASSWORD
+                    : descriptor;
+            final PropertyValue delegateValue = delegate.getProperty(resolvedDescriptor);
+            final Map<String, String> attrs = attributeSnapshot.get();
+            if (attrs != null && !attrs.isEmpty()) {
+                return delegateValue.evaluateAttributeExpressions(attrs);
             }
-
             return delegateValue;
         }
 
         @Override
         public Map<String, String> getAllProperties() {
-            return Map.of();
+            return delegate.getAllProperties();
         }
 
         @Override
