@@ -1,26 +1,32 @@
-# Batch processing flow — visual guide
+# Batch processing flow
 
-Use this file for **stakeholder-friendly** diagrams. The Mermaid block below uses **colors and short labels** so it reads well in GitHub, GitLab, Notion, or [Mermaid Live Editor](https://mermaid.live).
-
----
-
-## Draw.io vs other tools (quick recommendation)
-
-| Tool | Best for | Mermaid paste |
-|------|-----------|----------------|
-| **[Mermaid Live](https://mermaid.live)** | **Best first step** — paste code, pick theme, export **SVG** or **PNG** with consistent colors | Native — looks as designed |
-| **Draw.io (diagrams.net)** | Manual polish, exact branding, drag icons | Mermaid is **imported as editable shapes**; **theme/colors often look plain or differ** from Mermaid Live — not a bug, just different engine |
-| **GitHub / GitLab** | Docs next to code | Renders Mermaid in `.md` files well |
-| **Notion / Confluence** | Wikis for mixed audiences | Good Mermaid support |
-| **Excalidraw** | Workshops, “sketch” feel | No Mermaid — draw by hand or **paste SVG** exported from Mermaid Live |
-
-**Practical workflow for Draw.io:** paste the diagram in **Mermaid Live** → **Actions → Export SVG** → in Draw.io **File → Import** the SVG. You keep the colors and can still add logos/text boxes on top.
+Short guide for **non-technical** readers. Optional diagram at the end for slides or documentation tools that support Mermaid.
 
 ---
 
-## Colored flowchart (copy everything inside the fence)
+## How this flow works (plain language)
 
-Paste into [mermaid.live](https://mermaid.live) for the nicest preview, or into any Markdown viewer that supports Mermaid.
+- **One place for configuration**  
+  Each batch flow (where data comes from, where it goes, when it runs, and other settings) is stored in a central table: **`nifi_flow_definition`**. Think of it as the “recipe book” for all similar jobs.
+
+- **The schedule is written in advance**  
+  Using the timing rules from that configuration, the system fills another table — **`nifi_schedule_occurrence`** — with one row per run that should happen. New rows start as **“waiting to start”** (*PENDING*).
+
+- **NiFi picks up work when it is due**  
+  A small automated step in **Apache NiFi** (your integration platform) reads the schedule table, finds runs that are **waiting**, and starts the right job. When a run starts, that row is marked as **“in progress”** (*RUNNING*).
+
+- **One reusable template for many flows**  
+  Instead of building dozens of separate NiFi diagrams, you use **one reusable process group** — the same steps, driven by the data passed in for each run (source, target, paths, and so on).
+
+- **Custom “list” steps fix standard limitations**  
+  Inside that template, **custom list processors** (for SMB and SFTP) connect to remote folders using those passed-in details. They can signal **success**, **no files to process**, or **failure** clearly — so operations and downstream steps always know what happened.
+
+- **The database is updated when the run ends**  
+  When the NiFi flow finishes, the matching row in **`nifi_schedule_occurrence`** is updated to **completed successfully** (*SUCCESS*) or **completed with a problem** (*FAIL*). That gives you a clear history of what ran and how it ended.
+
+---
+
+## Diagram (optional)
 
 ```mermaid
 %%{init: {
@@ -35,42 +41,47 @@ Paste into [mermaid.live](https://mermaid.live) for the nicest preview, or into 
     "secondaryColor": "#fff8e1",
     "tertiaryColor": "#e8f5e9"
   },
-  "flowchart": { "htmlLabels": true, "curve": "basis", "padding": 12 }
+  "flowchart": { "htmlLabels": true, "curve": "basis", "padding": 16 }
 }}%%
 flowchart TB
   subgraph DB[" 🗄️ Database "]
+    direction TB
     T1["nifi_flow_definition<br/><small>Source, target, schedule, …</small>"]
     T2["nifi_schedule_occurrence<br/><small>PENDING → RUNNING → SUCCESS / FAIL</small>"]
+    T1 --> T2
   end
 
   subgraph PLAN[" 📅 Planning "]
+    direction TB
     A["All flows configured<br/>in one place"]
     B["Scheduler fills<br/>next run times"]
     A --> B
   end
 
   subgraph NIFI[" ⚙️ Apache NiFi "]
+    direction TB
     C["Starter reads<br/>PENDING work"]
     D["Mark run as<br/>RUNNING"]
-    E["One reusable process group<br/><small>Metadata on the FlowFile</small>"]
+    E["Hand off metadata<br/><small>Attributes on the FlowFile</small>"]
     C --> D --> E
   end
 
   subgraph CUSTOM[" ⭐ Custom list processors "]
-    F["ListSMBExtended<br/>ListSFTPExtended<br/><small>Trigger • variables • errors • “no files”</small>"]
+    direction TB
+    F["<b>One reusable process group</b><br/>ListSMBExtended · ListSFTPExtended<br/><small>Trigger · variables · failure path · “No Files” path</small>"]
   end
 
   subgraph CLOSE[" ✅ Finish "]
+    direction TB
     G["Update database<br/>SUCCESS or FAIL"]
   end
 
-  T1 -.-> A
-  B -.-> T2
-  T2 <-->|read / update| C
-  D -.-> T2
+  T1 -.->|defines| A
+  B -.->|creates / updates rows| T2
+  T2 -->|next due run| C
   E --> F
   F --> G
-  G -.-> T2
+  G -.->|writes final status| T2
 
   classDef db fill:#e3f2fd,stroke:#1565c0,stroke-width:2px,color:#0d47a1
   classDef plan fill:#fff8e1,stroke:#f57c00,stroke-width:2px,color:#e65100
@@ -87,15 +98,6 @@ flowchart TB
 
 ---
 
-## Why Draw.io can look “wrong” with Mermaid
+## One sentence you can paste into an email
 
-- Draw.io **translates** Mermaid into its own shapes; not every Mermaid style or `classDef` maps 1:1.
-- Long labels in one line can **stretch boxes** — the diagram above uses `<br/>` and `<small>` for cleaner layout where supported.
-
-If you need **pixel-perfect** slides, export **SVG from Mermaid Live** and import into Draw.io (or PowerPoint).
-
----
-
-## One-line summary (for slides)
-
-**Database holds definitions and schedule rows → NiFi picks up due work → custom list processors run with that metadata → database records SUCCESS or FAIL.**
+**We store all flow settings and schedules in the database; NiFi starts each run when it is due, using one shared template and custom list steps so we always know if files were found, nothing was there, or something failed — then we write the final status back to the database.**
