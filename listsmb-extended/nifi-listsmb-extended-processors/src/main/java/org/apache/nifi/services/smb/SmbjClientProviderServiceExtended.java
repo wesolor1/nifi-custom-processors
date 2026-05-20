@@ -74,7 +74,7 @@ public class SmbjClientProviderServiceExtended extends AbstractControllerService
             .description("The password used for authentication.")
             .required(false)
             .addValidator(NON_EMPTY_VALIDATOR)
-            .sensitive(true)
+            .sensitive(false)
             .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 

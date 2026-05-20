@@ -742,7 +742,8 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
         public PropertyValue getProperty(final PropertyDescriptor descriptor) {
             final PropertyValue delegateValue = delegate.getProperty(descriptor);
             final Map<String, String> attrs = attributeSnapshot.get();
-            if (attrs != null && !attrs.isEmpty()) {
+            if (attrs != null && !attrs.isEmpty()
+                    && descriptor.getExpressionLanguageScope() == ExpressionLanguageScope.FLOWFILE_ATTRIBUTES) {
                 return delegateValue.evaluateAttributeExpressions(attrs);
             }
             return delegateValue;

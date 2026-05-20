@@ -19,6 +19,7 @@ import org.apache.nifi.components.state.StateManager;
 import org.apache.nifi.controller.ControllerServiceLookup;
 import org.apache.nifi.scheduling.ExecutionNode;
 import org.apache.nifi.context.PropertyContext;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.migration.PropertyConfiguration;
 import org.apache.nifi.processor.DataUnit;
@@ -91,6 +92,15 @@ public class ListSFTPExtended extends ListFileTransfer {
     public static final PropertyDescriptor PASSWORD = new PropertyDescriptor.Builder()
             .fromPropertyDescriptor(SFTPTransfer.PASSWORD)
             .sensitive(false)
+            .build();
+
+    /**
+     * Override the stock REMOTE_PATH descriptor so the directory path can be driven by incoming trigger FlowFile
+     * attributes (e.g. {@code ${input.path}}). The stock descriptor only supports ENVIRONMENT-scope EL.
+     */
+    public static final PropertyDescriptor REMOTE_PATH = new PropertyDescriptor.Builder()
+            .fromPropertyDescriptor(ListFileTransfer.REMOTE_PATH)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
@@ -417,12 +427,18 @@ public class ListSFTPExtended extends ListFileTransfer {
 
         @Override
         public PropertyValue getProperty(final PropertyDescriptor descriptor) {
-            final PropertyDescriptor resolvedDescriptor = PASSWORD.getName().equals(descriptor.getName())
-                    ? PASSWORD
-                    : descriptor;
+            final PropertyDescriptor resolvedDescriptor;
+            if (PASSWORD.getName().equals(descriptor.getName())) {
+                resolvedDescriptor = PASSWORD;
+            } else if (REMOTE_PATH.getName().equals(descriptor.getName())) {
+                resolvedDescriptor = REMOTE_PATH;
+            } else {
+                resolvedDescriptor = descriptor;
+            }
             final PropertyValue delegateValue = delegate.getProperty(resolvedDescriptor);
             final Map<String, String> attrs = attributeSnapshot.get();
-            if (attrs != null && !attrs.isEmpty()) {
+            if (attrs != null && !attrs.isEmpty()
+                    && resolvedDescriptor.getExpressionLanguageScope() == ExpressionLanguageScope.FLOWFILE_ATTRIBUTES) {
                 return delegateValue.evaluateAttributeExpressions(attrs);
             }
             return delegateValue;
