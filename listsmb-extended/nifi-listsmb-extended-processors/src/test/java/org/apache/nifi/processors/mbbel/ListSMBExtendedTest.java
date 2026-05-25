@@ -60,6 +60,39 @@ public class ListSMBExtendedTest {
             }
             throw new IOException("simulated smb listing failure");
         }
+
+        @Override
+        protected Integer countUnfilteredListing(final ProcessContext context) {
+            return 0;
+        }
+    }
+
+    /** Returns one fake {@link SmbListableEntity} so we can exercise the success route without real SMB I/O. */
+    private static class SingleFileListingSmb extends ListSMBExtended {
+        @Override
+        protected Integer countUnfilteredListing(final ProcessContext context) {
+            return 1;
+        }
+
+        @Override
+        protected List<SmbListableEntity> performListing(final ProcessContext context, final Long minimumTimestampOrNull,
+                                                        final org.apache.nifi.processor.util.list.AbstractListProcessor.ListingMode listingMode) {
+            final SmbListableEntity entity = SmbListableEntity.builder()
+                    .setName("test.txt")
+                    .setShortName("test.txt")
+                    .setPath("sub/folder")
+                    .setDirectory(false)
+                    .setSize(456L)
+                    .setAllocationSize(512L)
+                    // back-date so we satisfy MINIMUM_AGE default (5 secs).
+                    .setLastModifiedTime(System.currentTimeMillis() - 60_000L)
+                    .setCreationTime(System.currentTimeMillis() - 60_000L)
+                    .setLastAccessTime(System.currentTimeMillis() - 60_000L)
+                    .setChangeTime(System.currentTimeMillis() - 60_000L)
+                    .setServiceLocation(URI.create("smb://localhost:445/share"))
+                    .build();
+            return List.of(entity);
+        }
     }
 
     private static class MockSmbClientProviderService extends AbstractControllerService implements SmbClientProviderService {
@@ -176,6 +209,109 @@ public class ListSMBExtendedTest {
     public void testSmbClientProviderPasswordIsNotSensitive() {
         assertFalse(SmbjClientProviderServiceExtended.PASSWORD.isSensitive(),
                 "SmbjClientProviderServiceExtended PASSWORD descriptor should be non-sensitive");
+    }
+
+    // -----------------------------------------------------------------
+    // Runtime behavior tests (drive onTrigger with TestRunner)
+    // -----------------------------------------------------------------
+
+    private static TestRunner newRunner(final ListSMBExtended processor) throws Exception {
+        final TestRunner runner = TestRunners.newTestRunner(processor);
+
+        final MockSmbClientProviderService smbProvider = new MockSmbClientProviderService();
+        runner.addControllerService("smb-provider", smbProvider);
+        runner.enableControllerService(smbProvider);
+
+        runner.setProperty(ListSMBExtended.SMB_CLIENT_PROVIDER_SERVICE, "smb-provider");
+        runner.setProperty(ListSMBExtended.SMB_LISTING_STRATEGY, AbstractListProcessor.NO_TRACKING.getValue());
+        return runner;
+    }
+
+    private static void registerWriter(final TestRunner runner) throws Exception {
+        final MockWriterFactory writerFactory = new MockWriterFactory();
+        runner.addControllerService("writer", writerFactory);
+        runner.enableControllerService(writerFactory);
+        runner.setProperty(AbstractListProcessor.RECORD_WRITER, "writer");
+    }
+
+    @Test
+    public void testNoFilesRouteEmitsFlowFileWithIncomingAttributes() throws Exception {
+        final TestRunner runner = newRunner(new EmptyListingSmb());
+        registerWriter(runner);
+
+        runner.enqueue("trigger", Map.of("batch.id", "B1", "input.path", "ignored"));
+        runner.run(1);
+
+        runner.assertTransferCount(ListSMBExtended.REL_NO_FILES, 1);
+        runner.assertTransferCount(ListSMBExtended.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListSMBExtended.REL_FAILURE, 0);
+
+        final MockFlowFile emitted = runner.getFlowFilesForRelationship(ListSMBExtended.REL_NO_FILES).get(0);
+        emitted.assertAttributeEquals("batch.id", "B1");
+        emitted.assertAttributeEquals("record.count", "0");
+        emitted.assertAttributeEquals("mime.type", "application/test");
+        emitted.assertAttributeEquals("smb.service.location", "smb://localhost:445/share");
+    }
+
+    @Test
+    public void testNoFilesRouteResolvesDirectoryExpressionLanguageFromIncomingAttributes() throws Exception {
+        final TestRunner runner = newRunner(new EmptyListingSmb());
+        runner.setProperty(ListSMBExtended.DIRECTORY, "${input.dir}");
+        registerWriter(runner);
+
+        runner.enqueue("trigger", Map.of("input.dir", "shared/incoming"));
+        runner.run(1);
+
+        final MockFlowFile emitted = runner.getFlowFilesForRelationship(ListSMBExtended.REL_NO_FILES).get(0);
+        emitted.assertAttributeEquals("smb.listing.directory", "shared/incoming");
+    }
+
+    @Test
+    public void testListingFailureRouteEmitsFailureFlowFileWithIncomingAttributes() throws Exception {
+        final TestRunner runner = newRunner(new ExceptionListingSmb());
+
+        runner.enqueue("trigger", Map.of("batch.id", "B2"));
+        runner.run(1);
+
+        runner.assertTransferCount(ListSMBExtended.REL_FAILURE, 1);
+        runner.assertTransferCount(ListSMBExtended.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListSMBExtended.REL_NO_FILES, 0);
+
+        final MockFlowFile failure = runner.getFlowFilesForRelationship(ListSMBExtended.REL_FAILURE).get(0);
+        failure.assertAttributeEquals("batch.id", "B2");
+        failure.assertAttributeEquals("error.message", "simulated smb listing failure");
+        failure.assertAttributeExists("error.class");
+        failure.assertAttributeEquals("smb.service.location", "smb://localhost:445/share");
+    }
+
+    @Test
+    public void testSuccessRouteCopiesIncomingAttributes() throws Exception {
+        final TestRunner runner = newRunner(new SingleFileListingSmb());
+
+        runner.enqueue("trigger", Map.of("batch.id", "B3"));
+        runner.run(1);
+
+        runner.assertTransferCount(ListSMBExtended.REL_SUCCESS, 1);
+        runner.assertTransferCount(ListSMBExtended.REL_NO_FILES, 0);
+        runner.assertTransferCount(ListSMBExtended.REL_FAILURE, 0);
+
+        final MockFlowFile emitted = runner.getFlowFilesForRelationship(ListSMBExtended.REL_SUCCESS).get(0);
+        emitted.assertAttributeEquals("batch.id", "B3");
+        emitted.assertAttributeEquals("filename", "test.txt");
+        emitted.assertAttributeEquals("path", "sub/folder");
+    }
+
+    @Test
+    public void testTriggerFlowFileIsRemovedFromSession() throws Exception {
+        final TestRunner runner = newRunner(new EmptyListingSmb());
+
+        runner.enqueue("trigger", Map.of("batch.id", "B4"));
+        runner.run(1);
+
+        runner.assertQueueEmpty();
+        runner.assertTransferCount(ListSMBExtended.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListSMBExtended.REL_NO_FILES, 0);
+        runner.assertTransferCount(ListSMBExtended.REL_FAILURE, 0);
     }
 }
 

@@ -23,6 +23,8 @@ import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.controller.AbstractControllerService;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.util.file.transfer.FileInfo;
+import org.apache.nifi.processor.util.file.transfer.ListFileTransfer;
+import org.apache.nifi.processor.util.list.AbstractListProcessor;
 import org.apache.nifi.processors.standard.util.SFTPTransfer;
 import org.apache.nifi.serialization.RecordSetWriter;
 import org.apache.nifi.serialization.RecordSetWriterFactory;
@@ -58,6 +60,56 @@ public class ListSFTPExtendedTest {
                                                 final boolean applyFilters) throws IOException {
             throw new IOException("simulated listing failure");
         }
+    }
+
+    /** Returns a single fake {@link FileInfo} so we can drive the success path without real SFTP I/O. */
+    private static class SingleFileListingSftp extends ListSFTPExtended {
+        @Override
+        protected List<FileInfo> performListing(final ProcessContext context, final Long minTimestamp, final ListingMode listingMode,
+                                                final boolean applyFilters) {
+            final FileInfo file = new FileInfo.Builder()
+                    .filename("test.txt")
+                    .fullPathFileName("/remote/dir/test.txt")
+                    .directory(false)
+                    .size(123L)
+                    // back-date so we are older than ListFile.MIN_AGE (default 5 secs).
+                    .lastModifiedTime(System.currentTimeMillis() - 60_000L)
+                    .permissions("rw-r--r--")
+                    .owner("nifi")
+                    .group("nifi")
+                    .build();
+            return List.of(file);
+        }
+
+        /**
+         * Bypass the parent {@code ListFileTransfer.createAttributes}, which calls
+         * {@code context.getProperty(HOSTNAME).evaluateAttributeExpressions()} (no args).
+         * NiFi's {@code MockPropertyValue} (unlike real NiFi) rejects no-args evaluation on
+         * FLOWFILE_ATTRIBUTES-scoped properties, so we just return a minimal listing attribute map.
+         * The trigger-attribute merge still happens via the {@code withTriggerAttributes} proxy.
+         */
+        @Override
+        protected Map<String, String> createAttributes(final FileInfo fileInfo, final ProcessContext context) {
+            return Map.of(
+                    "filename", fileInfo.getFileName(),
+                    "file.size", String.valueOf(fileInfo.getSize()));
+        }
+    }
+
+    private static TestRunner newRunner(final ListSFTPExtended processor) throws Exception {
+        final TestRunner runner = TestRunners.newTestRunner(processor);
+        runner.setProperty(ListFileTransfer.HOSTNAME, "sftp.example.com");
+        runner.setProperty(SFTPTransfer.USERNAME, "tester");
+        runner.setProperty(ListSFTPExtended.REMOTE_PATH, "/remote/dir");
+        runner.setProperty(ListFileTransfer.FILE_TRANSFER_LISTING_STRATEGY, AbstractListProcessor.NO_TRACKING.getValue());
+        return runner;
+    }
+
+    private static void registerWriter(final TestRunner runner) throws Exception {
+        final MockWriterFactory writerFactory = new MockWriterFactory();
+        runner.addControllerService("writer", writerFactory);
+        runner.enableControllerService(writerFactory);
+        runner.setProperty(AbstractListProcessor.RECORD_WRITER, "writer");
     }
 
     private static class MockWriterFactory extends AbstractControllerService implements RecordSetWriterFactory {
@@ -150,6 +202,81 @@ public class ListSFTPExtendedTest {
     public void testCustomPasswordIsNotSensitive() {
         assertFalse(ListSFTPExtended.PASSWORD.isSensitive(),
                 "ListSFTPExtended PASSWORD descriptor should override stock SFTPTransfer.PASSWORD to be non-sensitive");
+    }
+
+    // -----------------------------------------------------------------
+    // Runtime behavior tests (drive onTrigger with TestRunner)
+    // -----------------------------------------------------------------
+
+    @Test
+    public void testNoFilesRouteEmitsFlowFileWithIncomingAttributes() throws Exception {
+        final TestRunner runner = newRunner(new EmptyListingSftp());
+        registerWriter(runner);
+
+        runner.enqueue("trigger", Map.of("batch.id", "B1", "target.host", "ignored"));
+        runner.run(1);
+
+        runner.assertTransferCount(ListSFTPExtended.REL_NO_FILES, 1);
+        runner.assertTransferCount(ListSFTPExtended.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListSFTPExtended.REL_FAILURE, 0);
+
+        final MockFlowFile emitted = runner.getFlowFilesForRelationship(ListSFTPExtended.REL_NO_FILES).get(0);
+        emitted.assertAttributeEquals("batch.id", "B1");
+        emitted.assertAttributeEquals("record.count", "0");
+        emitted.assertAttributeEquals("mime.type", "application/test");
+    }
+
+    @Test
+    public void testNoFilesRouteResolvesExpressionLanguageFromIncomingAttributes() throws Exception {
+        final TestRunner runner = newRunner(new EmptyListingSftp());
+        runner.setProperty(ListFileTransfer.HOSTNAME, "${target.host}");
+        runner.setProperty(SFTPTransfer.USERNAME, "${target.user}");
+        registerWriter(runner);
+
+        runner.enqueue("trigger", Map.of("target.host", "actual-host.example", "target.user", "jdoe"));
+        runner.run(1);
+
+        final MockFlowFile emitted = runner.getFlowFilesForRelationship(ListSFTPExtended.REL_NO_FILES).get(0);
+        emitted.assertAttributeEquals("sftp.remote.host", "actual-host.example");
+        emitted.assertAttributeEquals("sftp.listing.user", "jdoe");
+    }
+
+    @Test
+    public void testSuccessRouteCopiesIncomingAttributesAndListingTakesPrecedence() throws Exception {
+        final TestRunner runner = newRunner(new SingleFileListingSftp());
+        runner.assertValid();
+
+        runner.enqueue("trigger", Map.of(
+                "batch.id", "B2",
+                "filename", "should-be-overridden-by-listing"));
+        runner.run(1);
+
+        final int success = runner.getFlowFilesForRelationship(ListSFTPExtended.REL_SUCCESS).size();
+        final int noFiles = runner.getFlowFilesForRelationship(ListSFTPExtended.REL_NO_FILES).size();
+        final List<MockFlowFile> failures = runner.getFlowFilesForRelationship(ListSFTPExtended.REL_FAILURE);
+        final int failure = failures.size();
+        final String firstFailureError = failure == 0 ? "" : failures.get(0).getAttribute("error.message");
+        assertEquals(1, success, "Expected listing to produce a success FlowFile (success=" + success
+                + ", no_files=" + noFiles + ", failure=" + failure + ", firstFailureError=" + firstFailureError + ")");
+        assertEquals(0, noFiles);
+        assertEquals(0, failure);
+
+        final MockFlowFile emitted = runner.getFlowFilesForRelationship(ListSFTPExtended.REL_SUCCESS).get(0);
+        emitted.assertAttributeEquals("batch.id", "B2");
+        emitted.assertAttributeEquals("filename", "test.txt");
+    }
+
+    @Test
+    public void testTriggerFlowFileIsRemovedFromSession() throws Exception {
+        final TestRunner runner = newRunner(new EmptyListingSftp());
+
+        runner.enqueue("trigger", Map.of("batch.id", "B3"));
+        runner.run(1);
+
+        runner.assertQueueEmpty();
+        runner.assertTransferCount(ListSFTPExtended.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListSFTPExtended.REL_NO_FILES, 0);
+        runner.assertTransferCount(ListSFTPExtended.REL_FAILURE, 0);
     }
 
 }
