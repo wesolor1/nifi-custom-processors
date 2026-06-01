@@ -1,0 +1,149 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Licensed to the Apache Software Foundation (ASF) under one or more
+  contributor license agreements. See the NOTICE file distributed with
+  this work for additional information regarding copyright ownership.
+  The ASF licenses this file to You under the Apache License, Version 2.0
+  (the "License"); you may not use this file except in compliance with
+  the License. You may obtain a copy of the License at
+  http://www.apache.org/licenses/LICENSE-2.0
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+-->
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.apache.nifi</groupId>
+        <artifactId>lists3-extended</artifactId>
+        <version>2.9.0</version>
+    </parent>
+
+    <artifactId>nifi-lists3-extended-processors</artifactId>
+    <packaging>jar</packaging>
+
+    <properties>
+        <software.amazon.awssdk.version>2.42.28</software.amazon.awssdk.version>
+    </properties>
+
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-api</artifactId>
+            <version>${nifi.api.version}</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!--
+            Provides ListS3, AbstractS3Processor and (transitively, at compile/test scope)
+            the AWS SDK classes. PROVIDED so none of it is bundled inside this JAR; the
+            nifi-aws-nar supplies these classes at runtime.
+        -->
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-aws-processors</artifactId>
+            <version>2.9.0</version>
+            <scope>provided</scope>
+        </dependency>
+        <!--
+            ListS3's superclasses (AbstractS3Processor / AbstractAwsProcessor / RegionUtil) and the AWS SDK S3Client
+            type are declared 'provided' inside the AWS bundle, so they are not inherited transitively. Declare them
+            explicitly (still 'provided') so the subclass compiles; the nifi-aws-nar supplies them at runtime.
+        -->
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-aws-abstract-processors</artifactId>
+            <version>2.9.0</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>software.amazon.awssdk</groupId>
+            <artifactId>s3</artifactId>
+            <version>${software.amazon.awssdk.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-aws-service-api</artifactId>
+            <version>2.9.0</version>
+            <scope>provided</scope>
+        </dependency>
+        <!--
+            Controller-service API types referenced by AbstractAwsProcessor's static initializer
+            (SSL context, proxy configuration, file resource, OAuth2). Needed on the compile/test classpath
+            because they are provided (non-transitive) inside the AWS bundle; supplied at runtime by the NAR.
+        -->
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-ssl-context-service-api</artifactId>
+            <version>2.9.0</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-proxy-configuration-api</artifactId>
+            <version>2.9.0</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-file-resource-service-api</artifactId>
+            <version>2.9.0</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-oauth2-provider-api</artifactId>
+            <version>2.9.0</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-record-serialization-service-api</artifactId>
+            <version>2.9.0</version>
+            <scope>provided</scope>
+        </dependency>
+        <!--
+            Runtime libraries that AbstractAwsProcessor/ListS3 use internally (client cache, collections). These are
+            'provided' inside the AWS bundle and therefore not inherited transitively; supplied at runtime by the NAR.
+        -->
+        <dependency>
+            <groupId>com.github.ben-manes.caffeine</groupId>
+            <artifactId>caffeine</artifactId>
+            <version>3.2.3</version>
+            <scope>provided</scope>
+        </dependency>
+        <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+            <version>33.5.0-jre</version>
+            <scope>provided</scope>
+        </dependency>
+
+        <!-- TEST dependencies -->
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-mock</artifactId>
+            <version>2.9.0</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-simple</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-api</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.junit.jupiter</groupId>
+            <artifactId>junit-jupiter-engine</artifactId>
+            <scope>test</scope>
+        </dependency>
+    </dependencies>
+</project>
