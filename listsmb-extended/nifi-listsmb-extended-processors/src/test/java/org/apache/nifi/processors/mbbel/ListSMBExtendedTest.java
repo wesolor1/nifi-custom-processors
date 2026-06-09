@@ -211,6 +211,39 @@ public class ListSMBExtendedTest {
                 "SmbjClientProviderServiceExtended PASSWORD descriptor should be non-sensitive");
     }
 
+    @Test
+    public void testFileAndPathFilterAcceptExpressionLanguageWithoutValidationError() throws Exception {
+        final TestRunner runner = newRunner(new ListSMBExtended());
+        runner.setProperty(ListSMBExtended.FILE_FILTER, "${file_filter}");
+        runner.setProperty(ListSMBExtended.PATH_FILTER, "${path_filter}");
+        // Previously this produced "Not a valid Java Regular Expression" because the literal EL was compiled at config time.
+        runner.assertValid();
+    }
+
+    @Test
+    public void testInvalidLiteralRegexFilterIsRejected() throws Exception {
+        final TestRunner runner = newRunner(new ListSMBExtended());
+        runner.setProperty(ListSMBExtended.FILE_FILTER, "[");
+        runner.assertNotValid();
+    }
+
+    @Test
+    public void testBlankResolvedFilterIsIgnored() throws Exception {
+        final TestRunner runner = newRunner(new ListSMBExtended());
+        runner.setProperty(ListSMBExtended.FILE_FILTER, "${file_filter}");
+        final ProcessContext context = runner.getProcessContext();
+        final org.apache.nifi.components.PropertyValue fileFilter = context.getProperty(ListSMBExtended.FILE_FILTER);
+
+        // Missing or empty attribute -> filter resolves to empty -> no filter applied.
+        assertNull(ListSMBExtended.compileFilterOrNull(fileFilter, Map.of()),
+                "Missing attribute should resolve to no filter");
+        assertNull(ListSMBExtended.compileFilterOrNull(fileFilter, Map.of("file_filter", "")),
+                "Empty attribute value should resolve to no filter");
+        // Present attribute -> a compiled pattern is returned.
+        assertNotNull(ListSMBExtended.compileFilterOrNull(fileFilter, Map.of("file_filter", "te.*")),
+                "Non-empty attribute value should produce a compiled pattern");
+    }
+
     // -----------------------------------------------------------------
     // Runtime behavior tests (drive onTrigger with TestRunner)
     // -----------------------------------------------------------------

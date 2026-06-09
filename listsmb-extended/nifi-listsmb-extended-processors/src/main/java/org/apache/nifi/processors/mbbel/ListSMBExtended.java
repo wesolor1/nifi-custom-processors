@@ -29,7 +29,6 @@ import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.exception.ProcessException;
-import org.apache.nifi.processor.util.StandardValidators;
 import org.apache.nifi.scheduling.ExecutionNode;
 import org.apache.nifi.scheduling.SchedulingStrategy;
 import org.apache.nifi.processor.util.list.AbstractListProcessor;
@@ -204,21 +203,56 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
             .identifiesControllerService(SmbClientProviderService.class)
             .build();
 
+    /**
+     * Regex validator that is aware of Expression Language: when the configured value contains EL (e.g.
+     * {@code ${file_filter}}) the actual pattern is only known at runtime against FlowFile attributes, so the literal
+     * is not compiled here. A blank value is treated as "no filter" since these properties are optional.
+     */
+    static final Validator EL_AWARE_REGULAR_EXPRESSION_VALIDATOR = (subject, input, context) -> {
+        if (context.isExpressionLanguageSupported(subject) && context.isExpressionLanguagePresent(input)) {
+            return new ValidationResult.Builder()
+                    .subject(subject)
+                    .input(input)
+                    .valid(true)
+                    .explanation("Expression Language present; pattern is evaluated at runtime.")
+                    .build();
+        }
+        if (input == null || input.isBlank()) {
+            return new ValidationResult.Builder()
+                    .subject(subject)
+                    .input(input)
+                    .valid(true)
+                    .explanation("Empty value; no filter will be applied.")
+                    .build();
+        }
+        try {
+            Pattern.compile(input);
+            return new ValidationResult.Builder().subject(subject).input(input).valid(true).build();
+        } catch (final Exception e) {
+            return new ValidationResult.Builder()
+                    .subject(subject)
+                    .input(input)
+                    .valid(false)
+                    .explanation("Not a valid Java Regular Expression: " + e.getMessage())
+                    .build();
+        }
+    };
+
     public static final PropertyDescriptor FILE_FILTER = new Builder()
             .name("File Filter")
-            .description("Only files whose names match the given regular expression will be listed.")
+            .description("Only files whose names match the given regular expression will be listed. Supports Expression Language "
+                    + "against FlowFile attributes; if the resolved value is empty, no file name filter is applied.")
             .required(false)
-            .addValidator(NON_BLANK_VALIDATOR)
-            .addValidator(StandardValidators.REGULAR_EXPRESSION_VALIDATOR)
+            .addValidator(EL_AWARE_REGULAR_EXPRESSION_VALIDATOR)
             .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
     public static final PropertyDescriptor PATH_FILTER = new Builder()
             .name("Path Filter")
-            .description("Only files whose paths (up to the file's parent directory) match the given regular expression will be listed.")
+            .description("Only files whose paths (up to the file's parent directory) match the given regular expression will be listed. "
+                    + "Supports Expression Language against FlowFile attributes; if the resolved value is empty, no path filter is applied.")
             .required(false)
-            .addValidator(NON_BLANK_VALIDATOR)
-            .addValidator(StandardValidators.REGULAR_EXPRESSION_VALIDATOR)
+            .addValidator(EL_AWARE_REGULAR_EXPRESSION_VALIDATOR)
             .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
@@ -617,8 +651,11 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
         final Double maximumSizeOrNull =
                 context.getProperty(MAXIMUM_SIZE).isSet() ? context.getProperty(MAXIMUM_SIZE).asDataSize(DataUnit.B)
                         : null;
-        final Pattern filePatternOrNull = context.getProperty(FILE_FILTER).isSet() ? Pattern.compile(context.getProperty(FILE_FILTER).getValue()) : null;
-        final Pattern pathPatternOrNull = context.getProperty(PATH_FILTER).isSet() ? Pattern.compile(context.getProperty(PATH_FILTER).getValue()) : null;
+        final Map<String, String> elAttributes = triggerFlowAttributes.get() != null
+                ? triggerFlowAttributes.get()
+                : Collections.emptyMap();
+        final Pattern filePatternOrNull = compileFilterOrNull(context.getProperty(FILE_FILTER), elAttributes);
+        final Pattern pathPatternOrNull = compileFilterOrNull(context.getProperty(PATH_FILTER), elAttributes);
         final String ignoreSuffixOrNull = context.getProperty(IGNORE_FILES_WITH_SUFFIX).getValue();
 
         final long now = getCurrentTime();
@@ -657,6 +694,22 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
         }
 
         return filter;
+    }
+
+    /**
+     * Resolves a regex filter property against the supplied FlowFile attributes and compiles it. Returns {@code null}
+     * (meaning "no filter") when the property is unset or its resolved value is empty/blank, e.g. when an
+     * Expression Language reference such as {@code ${file_filter}} resolves to an empty or missing attribute.
+     */
+    static Pattern compileFilterOrNull(final PropertyValue property, final Map<String, String> elAttributes) {
+        if (!property.isSet()) {
+            return null;
+        }
+        final String value = property.evaluateAttributeExpressions(elAttributes).getValue();
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return Pattern.compile(value);
     }
 
     private Stream<SmbListableEntity> performListing(ProcessContext context) throws IOException {
