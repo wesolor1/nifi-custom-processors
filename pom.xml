@@ -15,6 +15,7 @@
         <module>listsftp-extended</module>
         <module>fetchsftp-extended</module>
         <module>lists3-extended</module>
+        <module>putsmbfile-extended</module>
         <module>finxact-websocket-listener</module>
         <module>websocket-listener</module>
     </modules>

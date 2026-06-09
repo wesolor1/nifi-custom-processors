@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+
+    <parent>
+        <groupId>org.apache.nifi</groupId>
+        <artifactId>putsmbfile-extended</artifactId>
+        <version>2.9.0</version>
+    </parent>
+
+    <artifactId>nifi-putsmbfile-extended-nar</artifactId>
+    <version>2.9.0</version>
+    <packaging>nar</packaging>
+
+    <!-- Exactly one dependency with <type>nar</type>: parent ClassLoader for this NAR (NiFi nar-maven-plugin rule). -->
+    <dependencies>
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-putsmbfile-extended-processors</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-smb-nar</artifactId>
+            <version>${nifi.version}</version>
+            <type>nar</type>
+        </dependency>
+    </dependencies>
+
+</project>
