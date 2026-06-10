@@ -310,7 +310,8 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
 
     public static final Relationship REL_NO_FILES = new Relationship.Builder()
             .name("No Files")
-            .description("A zero-record FlowFile when the remote directory has no file entries after listing (requires Record Writer).")
+            .description("A zero-record FlowFile when the listing yields no matching files after filters are applied "
+                    + "(including an empty remote directory; requires Record Writer).")
             .build();
 
     @Override
@@ -582,14 +583,12 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
 
         // If no writer factory, skip processing
         if (writerFactory == null) {
-            getLogger().debug("No Record Writer Factory configured; skipping emission for empty directory.");
+            getLogger().debug("No Record Writer Factory configured; skipping emission when no files match.");
             return;
         }
 
-        List<SmbListableEntity> listing;
         try {
-            final Integer entryCount = countUnfilteredListing(context);
-            if (entryCount == null || entryCount > 0) {
+            if (hasMatchingListingResults(context)) {
                 return;
             }
         } catch (final IOException e) {
@@ -624,11 +623,20 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
             emptyFlowFile = session.putAllAttributes(emptyFlowFile, attributes);
 
             session.transfer(emptyFlowFile, REL_NO_FILES);
-            getLogger().debug("Emitted zero-record FlowFile to No Files for empty SMB directory.");
+            getLogger().debug("Emitted zero-record FlowFile to No Files because no files matched the listing filters.");
         } catch (final Exception e) {
             getLogger().error("Failed to write empty listing FlowFile due to an error.", e);
             session.remove(emptyFlowFile);
         }
+    }
+
+    /**
+     * Whether the current listing configuration would yield at least one matching file (after file/path/age/size
+     * filters). Exposed as a protected method so tests can stub the remote check without contacting SMB.
+     */
+    protected boolean hasMatchingListingResults(final ProcessContext context) throws IOException {
+        final List<SmbListableEntity> listing = performListing(context, null, ListingMode.EXECUTION);
+        return listing != null && !listing.isEmpty();
     }
 
     private String formatTimeStamp(long timestamp) {

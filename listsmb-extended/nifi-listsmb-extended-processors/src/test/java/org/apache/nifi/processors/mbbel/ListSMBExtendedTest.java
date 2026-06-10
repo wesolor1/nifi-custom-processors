@@ -45,6 +45,20 @@ public class ListSMBExtendedTest {
         }
     }
 
+    /** Remote directory contains entries, but none survive file/path/age/size filters. */
+    private static class FilterExcludedListingSmb extends ListSMBExtended {
+        @Override
+        protected Integer countUnfilteredListing(final ProcessContext context) {
+            return 1;
+        }
+
+        @Override
+        protected List<SmbListableEntity> performListing(final ProcessContext context, final Long minimumTimestampOrNull,
+                                                        final org.apache.nifi.processor.util.list.AbstractListProcessor.ListingMode listingMode) throws IOException {
+            return Collections.emptyList();
+        }
+    }
+
     private static class ExceptionListingSmb extends ListSMBExtended {
         @Override
         protected List<SmbListableEntity> performListing(final ProcessContext context, final Long minimumTimestampOrNull,
@@ -297,6 +311,24 @@ public class ListSMBExtendedTest {
 
         final MockFlowFile emitted = runner.getFlowFilesForRelationship(ListSMBExtended.REL_NO_FILES).get(0);
         emitted.assertAttributeEquals("smb.listing.directory", "shared/incoming");
+    }
+
+    @Test
+    public void testNoFilesRouteWhenAllEntriesFilteredOut() throws Exception {
+        final TestRunner runner = newRunner(new FilterExcludedListingSmb());
+        runner.setProperty(ListSMBExtended.FILE_FILTER, ".*\\.csv");
+        registerWriter(runner);
+
+        runner.enqueue("trigger", Map.of("batch.id", "B-filtered"));
+        runner.run(1);
+
+        runner.assertTransferCount(ListSMBExtended.REL_NO_FILES, 1);
+        runner.assertTransferCount(ListSMBExtended.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListSMBExtended.REL_FAILURE, 0);
+
+        final MockFlowFile emitted = runner.getFlowFilesForRelationship(ListSMBExtended.REL_NO_FILES).get(0);
+        emitted.assertAttributeEquals("batch.id", "B-filtered");
+        emitted.assertAttributeEquals("record.count", "0");
     }
 
     @Test

@@ -54,6 +54,28 @@ public class ListSFTPExtendedTest {
         }
     }
 
+    /** Remote directory contains entries, but none survive file/age/size filters. */
+    private static class FilterExcludedListingSftp extends ListSFTPExtended {
+        @Override
+        protected List<FileInfo> performListing(final ProcessContext context, final Long minTimestamp, final ListingMode listingMode,
+                                                final boolean applyFilters) throws IOException {
+            if (applyFilters) {
+                return Collections.emptyList();
+            }
+            final FileInfo file = new FileInfo.Builder()
+                    .filename("other.txt")
+                    .fullPathFileName("/remote/dir/other.txt")
+                    .directory(false)
+                    .size(100L)
+                    .lastModifiedTime(System.currentTimeMillis() - 60_000L)
+                    .permissions("rw-r--r--")
+                    .owner("nifi")
+                    .group("nifi")
+                    .build();
+            return List.of(file);
+        }
+    }
+
     private static class ExceptionListingSftp extends ListSFTPExtended {
         @Override
         protected List<FileInfo> performListing(final ProcessContext context, final Long minTimestamp, final ListingMode listingMode,
@@ -239,6 +261,23 @@ public class ListSFTPExtendedTest {
         final MockFlowFile emitted = runner.getFlowFilesForRelationship(ListSFTPExtended.REL_NO_FILES).get(0);
         emitted.assertAttributeEquals("sftp.remote.host", "actual-host.example");
         emitted.assertAttributeEquals("sftp.listing.user", "jdoe");
+    }
+
+    @Test
+    public void testNoFilesRouteWhenAllEntriesFilteredOut() throws Exception {
+        final TestRunner runner = newRunner(new FilterExcludedListingSftp());
+        registerWriter(runner);
+
+        runner.enqueue("trigger", Map.of("batch.id", "B-filtered"));
+        runner.run(1);
+
+        runner.assertTransferCount(ListSFTPExtended.REL_NO_FILES, 1);
+        runner.assertTransferCount(ListSFTPExtended.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListSFTPExtended.REL_FAILURE, 0);
+
+        final MockFlowFile emitted = runner.getFlowFilesForRelationship(ListSFTPExtended.REL_NO_FILES).get(0);
+        emitted.assertAttributeEquals("batch.id", "B-filtered");
+        emitted.assertAttributeEquals("record.count", "0");
     }
 
     @Test
