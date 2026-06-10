@@ -31,6 +31,7 @@ import org.apache.nifi.processors.aws.region.RegionUtil;
 import org.apache.nifi.processors.aws.s3.AbstractS3Processor;
 import org.apache.nifi.processors.aws.s3.ListS3;
 import org.apache.nifi.reporting.InitializationException;
+import org.apache.nifi.serialization.record.MockRecordWriter;
 import org.apache.nifi.util.MockFlowFile;
 import org.apache.nifi.util.TestRunner;
 import org.apache.nifi.util.TestRunners;
@@ -70,10 +71,20 @@ public class ListS3ExtendedTest {
         volatile boolean listingPerformed = false;
         volatile String resolvedBucket;
         volatile boolean emitFlowFile = true;
+        volatile boolean bucketHasObjects = true;
+        volatile RuntimeException preflightException;
 
         @Override
         public void onScheduled(final ProcessContext context) {
             // Skip AbstractAwsProcessor's eager S3 client creation; this test double never contacts S3.
+        }
+
+        @Override
+        protected boolean remoteHasObjects(final ProcessContext context) {
+            if (preflightException != null) {
+                throw preflightException;
+            }
+            return bucketHasObjects;
         }
 
         @Override
@@ -205,6 +216,83 @@ public class ListS3ExtendedTest {
                 "Bucket Expression Language should resolve against the trigger FlowFile attributes");
         final MockFlowFile out = runner.getFlowFilesForRelationship(ListS3.REL_SUCCESS).get(0);
         out.assertAttributeEquals("s3.bucket", "resolved-bucket");
+    }
+
+    @Test
+    public void testRelationshipsIncludeFailureAndNoFiles() {
+        final ListS3Extended extended = new ListS3Extended();
+        assertTrue(extended.getRelationships().contains(ListS3Extended.REL_FAILURE),
+                "Extended processor should expose the Failure relationship");
+        assertTrue(extended.getRelationships().contains(ListS3Extended.REL_NO_FILES),
+                "Extended processor should expose the No Files relationship");
+    }
+
+    @Test
+    public void testListingFailureRoutesErrorFlowFileWithTriggerAttributes() throws InitializationException {
+        final TestableListS3Extended processor = new TestableListS3Extended();
+        processor.preflightException = new RuntimeException("simulated S3 failure");
+        final TestRunner runner = newRunner(processor);
+        runner.setProperty(ListS3Extended.BUCKET, "my-bucket");
+
+        final Map<String, String> triggerAttributes = new HashMap<>();
+        triggerAttributes.put("batch.id", "12345");
+        runner.enqueue("trigger".getBytes(), triggerAttributes);
+
+        runner.run();
+
+        runner.assertQueueEmpty();
+        runner.assertTransferCount(ListS3.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListS3Extended.REL_FAILURE, 1);
+
+        final MockFlowFile out = runner.getFlowFilesForRelationship(ListS3Extended.REL_FAILURE).get(0);
+        out.assertAttributeEquals("error.message", "simulated S3 failure");
+        out.assertAttributeEquals("error.class", RuntimeException.class.getName());
+        out.assertAttributeEquals("s3.bucket", "my-bucket");
+        out.assertAttributeEquals("batch.id", "12345");
+    }
+
+    @Test
+    public void testEmptyBucketRoutesZeroRecordFlowFileToNoFiles() throws InitializationException {
+        final TestableListS3Extended processor = new TestableListS3Extended();
+        processor.bucketHasObjects = false;
+        final TestRunner runner = newRunner(processor);
+        runner.setProperty(ListS3Extended.BUCKET, "my-bucket");
+
+        final MockRecordWriter writerFactory = new MockRecordWriter(null, false);
+        runner.addControllerService("record-writer", writerFactory);
+        runner.enableControllerService(writerFactory);
+        runner.setProperty(ListS3.RECORD_WRITER, "record-writer");
+
+        final Map<String, String> triggerAttributes = new HashMap<>();
+        triggerAttributes.put("batch.id", "12345");
+        runner.enqueue("trigger".getBytes(), triggerAttributes);
+
+        runner.run();
+
+        assertFalse(processor.listingPerformed, "The stock listing should be skipped when the bucket is empty");
+        runner.assertQueueEmpty();
+        runner.assertTransferCount(ListS3.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListS3Extended.REL_FAILURE, 0);
+        runner.assertTransferCount(ListS3Extended.REL_NO_FILES, 1);
+
+        final MockFlowFile out = runner.getFlowFilesForRelationship(ListS3Extended.REL_NO_FILES).get(0);
+        out.assertAttributeEquals("record.count", "0");
+        out.assertAttributeEquals("s3.bucket", "my-bucket");
+        out.assertAttributeEquals("batch.id", "12345");
+    }
+
+    @Test
+    public void testNoFilesIsNotEmittedWithoutRecordWriter() throws InitializationException {
+        final TestableListS3Extended processor = new TestableListS3Extended();
+        processor.bucketHasObjects = false;
+        final TestRunner runner = newRunner(processor);
+        runner.setProperty(ListS3Extended.BUCKET, "my-bucket");
+
+        runner.enqueue("trigger".getBytes());
+        runner.run();
+
+        runner.assertTransferCount(ListS3Extended.REL_NO_FILES, 0);
+        runner.assertTransferCount(ListS3Extended.REL_FAILURE, 0);
     }
 
     @Test

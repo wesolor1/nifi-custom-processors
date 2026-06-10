@@ -106,6 +106,13 @@
             <version>2.9.0</version>
             <scope>provided</scope>
         </dependency>
+        <!-- RecordSchema / SimpleRecordSchema used for the zero-record 'No Files' FlowFile. -->
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-record</artifactId>
+            <version>2.9.0</version>
+            <scope>provided</scope>
+        </dependency>
         <!--
             Runtime libraries that AbstractAwsProcessor/ListS3 use internally (client cache, collections). These are
             'provided' inside the AWS bundle and therefore not inherited transitively; supplied at runtime by the NAR.
@@ -127,6 +134,13 @@
         <dependency>
             <groupId>org.apache.nifi</groupId>
             <artifactId>nifi-mock</artifactId>
+            <version>2.9.0</version>
+            <scope>test</scope>
+        </dependency>
+        <!-- MockRecordWriter used by the 'No Files' tests. -->
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-mock-record-utils</artifactId>
             <version>2.9.0</version>
             <scope>test</scope>
         </dependency>
