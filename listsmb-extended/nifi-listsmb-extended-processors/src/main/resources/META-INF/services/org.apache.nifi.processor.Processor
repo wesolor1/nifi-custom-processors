@@ -14,3 +14,4 @@
 # limitations under the License.
 org.apache.nifi.processors.mbbel.ListSMBExtended
 org.apache.nifi.processors.mbbel.FetchSMBExtended
+org.apache.nifi.processors.mbbel.DeleteSmbExtended
