@@ -37,11 +37,29 @@
             <version>${nifi.version}</version>
             <scope>provided</scope>
         </dependency>
-        <!-- Bundle SMB client implementation: parent nifi-smb-nar does not expose package-private SmbjClientService to child NARs. -->
+        <!--
+            SMB client implementation. This jar also contains the stock SmbjClientProviderService controller service
+            AND its META-INF/services registration. If we bundled the whole jar, NiFi would expose that stock service
+            from this NAR (a duplicate of our SmbjClientProviderServiceExtended). So we keep it provided (compile-time
+            access to the package-private SmbjClientService) and bundle ONLY SmbjClientService.class via the
+            maven-dependency-plugin unpack below.
+        -->
         <dependency>
             <groupId>org.apache.nifi</groupId>
             <artifactId>nifi-smb-smbj-client</artifactId>
             <version>${nifi.version}</version>
+            <scope>provided</scope>
+        </dependency>
+        <!-- Runtime libraries previously bundled transitively via nifi-smb-smbj-client (now provided); bundle them explicitly. -->
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-smb-smbj-common</artifactId>
+            <version>${nifi.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>com.hierynomus</groupId>
+            <artifactId>smbj</artifactId>
+            <version>0.14.0</version>
         </dependency>
         <!-- API only: avoids pulling the full record-serialization-services tree (hundreds of deps, very slow NAR doc step). -->
         <dependency>
@@ -51,5 +69,43 @@
             <scope>provided</scope>
         </dependency>
     </dependencies>
+
+    <build>
+        <plugins>
+            <!--
+                Extract only the package-private SmbjClientService into this module's classes so it is packaged into
+                our processors jar (same classloader/package as SmbjClientProviderServiceExtended, enabling access to
+                its package-private constructor) WITHOUT pulling in the stock SmbjClientProviderService or its
+                controller-service registration.
+            -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-dependency-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <id>unpack-smbj-client-service</id>
+                        <phase>prepare-package</phase>
+                        <goals>
+                            <goal>unpack</goal>
+                        </goals>
+                        <configuration>
+                            <artifactItems>
+                                <artifactItem>
+                                    <groupId>org.apache.nifi</groupId>
+                                    <artifactId>nifi-smb-smbj-client</artifactId>
+                                    <version>${nifi.version}</version>
+                                    <type>jar</type>
+                                    <outputDirectory>${project.build.outputDirectory}</outputDirectory>
+                                    <includes>org/apache/nifi/services/smb/SmbjClientService.class</includes>
+                                </artifactItem>
+                            </artifactItems>
+                            <overWriteReleases>true</overWriteReleases>
+                            <overWriteSnapshots>true</overWriteSnapshots>
+                        </configuration>
+                    </execution>
+                </executions>
+            </plugin>
+        </plugins>
+    </build>
 
 </project>

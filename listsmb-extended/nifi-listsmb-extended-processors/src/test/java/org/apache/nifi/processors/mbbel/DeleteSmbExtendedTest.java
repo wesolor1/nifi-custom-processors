@@ -135,6 +135,26 @@ public class DeleteSmbExtendedTest {
     }
 
     @Test
+    public void testSuccessfulDeleteAllowsBackslashRemotePath() throws Exception {
+        final CapturingProviderService provider = new CapturingProviderService(null);
+        final TestRunner runner = newRunner(provider);
+        runner.setProperty(DeleteSmbExtended.REMOTE_FILE, "${source_directory}/${source_filename}");
+
+        runner.enqueue("ignored", Map.of(
+                "source_directory", "HOST\\SEWM0P002888.CON-02.EMEA.DC.CORPINTRA.NET\\DATA\\KRD\\TO-CRIS",
+                "source_filename", "CSV_dubbeltest_20250819100002380.csv"));
+        runner.run(1);
+
+        runner.assertTransferCount(DeleteSmbExtended.REL_SUCCESS, 1);
+        runner.assertTransferCount(DeleteSmbExtended.REL_NOT_FOUND, 0);
+        runner.assertTransferCount(DeleteSmbExtended.REL_FAILURE, 0);
+
+        assertEquals("HOST\\SEWM0P002888.CON-02.EMEA.DC.CORPINTRA.NET\\DATA\\KRD\\TO-CRIS/CSV_dubbeltest_20250819100002380.csv",
+                provider.deletedPath,
+                "The SMB delete call should receive the configured path unchanged; only provenance URI construction normalizes it");
+    }
+
+    @Test
     public void testMissingFileRoutesToNotFound() throws Exception {
         final CapturingProviderService provider = new CapturingProviderService(
                 new SmbException("not found", DeleteSmbExtended.STATUS_OBJECT_NAME_NOT_FOUND, null));

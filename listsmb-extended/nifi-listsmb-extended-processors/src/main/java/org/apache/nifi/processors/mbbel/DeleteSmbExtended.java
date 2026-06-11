@@ -21,6 +21,7 @@ import org.apache.nifi.services.smb.SmbException;
 import org.apache.nifi.services.smb.SmbjClientProviderServiceExtended;
 
 import java.net.URI;
+import java.net.URISyntaxException;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -121,11 +122,9 @@ public class DeleteSmbExtended extends AbstractProcessor {
 
         SmbjClientProviderServiceExtended.setEvaluationAttributes(attributes);
         try (SmbClientService client = clientProviderService.getClient(getLogger())) {
-            final URI transitUri = buildTransitUri(clientProviderService, filePath);
-
             client.deleteFile(filePath);
 
-            session.getProvenanceReporter().invokeRemoteProcess(flowFile, transitUri.toString(), "Object deleted");
+            session.getProvenanceReporter().invokeRemoteProcess(flowFile, buildTransitUri(clientProviderService, filePath), "Object deleted");
             session.transfer(flowFile, REL_SUCCESS);
         } catch (final Exception e) {
             if (isFileNotFound(e)) {
@@ -143,11 +142,25 @@ public class DeleteSmbExtended extends AbstractProcessor {
         }
     }
 
-    private URI buildTransitUri(final SmbClientProviderService clientProviderService, final String filePath) {
-        final String base = clientProviderService.getServiceLocation().toString();
-        final String separator = base.endsWith("/") ? "" : "/";
-        final String normalizedPath = filePath.startsWith("/") ? filePath.substring(1) : filePath;
-        return URI.create(base + separator + normalizedPath);
+    private String buildTransitUri(final SmbClientProviderService clientProviderService, final String filePath) {
+        final URI serviceLocation = clientProviderService.getServiceLocation();
+        final String basePath = Optional.ofNullable(serviceLocation.getPath()).orElse("");
+        final String normalizedPath = normalizeRelativePath(filePath);
+        final String separator = basePath.endsWith("/") || normalizedPath.isEmpty() ? "" : "/";
+        final String fullPath = basePath + separator + normalizedPath;
+
+        try {
+            return new URI(serviceLocation.getScheme(), serviceLocation.getAuthority(), fullPath, null, null).toString();
+        } catch (final URISyntaxException e) {
+            getLogger().debug("Could not build encoded SMB provenance URI for path {}; using normalized string", filePath, e);
+            final String base = serviceLocation.toString();
+            return base + (base.endsWith("/") || normalizedPath.isEmpty() ? "" : "/") + normalizedPath;
+        }
+    }
+
+    private String normalizeRelativePath(final String filePath) {
+        final String normalizedPath = filePath.replace('\\', '/');
+        return normalizedPath.startsWith("/") ? normalizedPath.substring(1) : normalizedPath;
     }
 
     private boolean isFileNotFound(final Exception exception) {
