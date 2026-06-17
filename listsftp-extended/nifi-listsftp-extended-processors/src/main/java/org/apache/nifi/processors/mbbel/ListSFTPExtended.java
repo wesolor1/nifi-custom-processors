@@ -14,6 +14,7 @@ import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.ValidationContext;
 import org.apache.nifi.components.ValidationResult;
+import org.apache.nifi.components.Validator;
 import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.components.state.StateManager;
 import org.apache.nifi.controller.ControllerServiceLookup;
@@ -52,6 +53,7 @@ import java.lang.reflect.Proxy;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Predicate;
+import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
 @TriggerSerially
@@ -62,7 +64,10 @@ import java.util.stream.Collectors;
         + "This processor can optionally accept incoming FlowFiles as trigger signals. Trigger attributes are used for "
         + "Expression Language and are copied onto each emitted listing FlowFile; listing attributes take precedence when names overlap. "
         + "The trigger FlowFile is removed so it is not emitted again with listing results. "
-        + "When a Record Writer is configured, a zero-record FlowFile is routed to No Files only when the remote directory has no file entries.")
+        + "When a Record Writer is configured, a zero-record FlowFile is routed to No Files only when the remote directory has no file entries. "
+        + "Password is non-sensitive and supports dynamic authentication: when the resolved Password, Private Key Path, or Private Key Passphrase "
+        + "is blank it is treated as unset so the other credential can be used. File Filter Regex and Path Filter Regex support Expression Language "
+        + "against trigger FlowFile attributes; blank resolved filter values are ignored.")
 @SeeAlso({FetchSFTP.class, GetSFTP.class, PutSFTP.class})
 @WritesAttributes({
         @WritesAttribute(attribute = "sftp.remote.host", description = "The hostname of the SFTP Server"),
@@ -95,6 +100,41 @@ public class ListSFTPExtended extends ListFileTransfer {
             .build();
 
     /**
+     * Regex validator that is aware of Expression Language: when the configured value contains EL (e.g.
+     * {@code ${file_filter}}) the actual pattern is only known at runtime against FlowFile attributes, so the literal
+     * is not compiled here. A blank value is treated as "no filter" since these properties are optional.
+     */
+    static final Validator EL_AWARE_REGULAR_EXPRESSION_VALIDATOR = (subject, input, context) -> {
+        if (context.isExpressionLanguageSupported(subject) && context.isExpressionLanguagePresent(input)) {
+            return new ValidationResult.Builder()
+                    .subject(subject)
+                    .input(input)
+                    .valid(true)
+                    .explanation("Expression Language present; pattern is evaluated at runtime.")
+                    .build();
+        }
+        if (input == null || input.isBlank()) {
+            return new ValidationResult.Builder()
+                    .subject(subject)
+                    .input(input)
+                    .valid(true)
+                    .explanation("Empty value; no filter will be applied.")
+                    .build();
+        }
+        try {
+            Pattern.compile(input);
+            return new ValidationResult.Builder().subject(subject).input(input).valid(true).build();
+        } catch (final Exception e) {
+            return new ValidationResult.Builder()
+                    .subject(subject)
+                    .input(input)
+                    .valid(false)
+                    .explanation("Not a valid Java Regular Expression: " + e.getMessage())
+                    .build();
+        }
+    };
+
+    /**
      * Override the stock REMOTE_PATH descriptor so the directory path can be driven by incoming trigger FlowFile
      * attributes (e.g. {@code ${input.path}}). The stock descriptor only supports ENVIRONMENT-scope EL.
      */
@@ -102,6 +142,39 @@ public class ListSFTPExtended extends ListFileTransfer {
             .fromPropertyDescriptor(ListFileTransfer.REMOTE_PATH)
             .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
+
+    public static final PropertyDescriptor FILE_FILTER_REGEX = new PropertyDescriptor.Builder()
+            .name(FileTransfer.FILE_FILTER_REGEX.getName())
+            .displayName(FileTransfer.FILE_FILTER_REGEX.getDisplayName())
+            .description(FileTransfer.FILE_FILTER_REGEX.getDescription())
+            .required(FileTransfer.FILE_FILTER_REGEX.isRequired())
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .addValidator(EL_AWARE_REGULAR_EXPRESSION_VALIDATOR)
+            .build();
+
+    public static final PropertyDescriptor PATH_FILTER_REGEX = new PropertyDescriptor.Builder()
+            .name(FileTransfer.PATH_FILTER_REGEX.getName())
+            .displayName(FileTransfer.PATH_FILTER_REGEX.getDisplayName())
+            .description(FileTransfer.PATH_FILTER_REGEX.getDescription())
+            .required(FileTransfer.PATH_FILTER_REGEX.isRequired())
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .addValidator(EL_AWARE_REGULAR_EXPRESSION_VALIDATOR)
+            .build();
+
+    private static final Set<String> BLANK_AS_UNSET_PROPERTY_NAMES = Set.of(
+            PASSWORD.getName(),
+            SFTPTransfer.PRIVATE_KEY_PATH.getName(),
+            SFTPTransfer.PRIVATE_KEY_PASSPHRASE.getName(),
+            FILE_FILTER_REGEX.getName(),
+            PATH_FILTER_REGEX.getName()
+    );
+
+    private static final Map<String, PropertyDescriptor> OVERRIDDEN_DESCRIPTORS_BY_NAME = Map.of(
+            PASSWORD.getName(), PASSWORD,
+            REMOTE_PATH.getName(), REMOTE_PATH,
+            FILE_FILTER_REGEX.getName(), FILE_FILTER_REGEX,
+            PATH_FILTER_REGEX.getName(), PATH_FILTER_REGEX
+    );
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
             FILE_TRANSFER_LISTING_STRATEGY,
@@ -115,8 +188,8 @@ public class ListSFTPExtended extends ListFileTransfer {
             RECORD_WRITER,
             SFTPTransfer.RECURSIVE_SEARCH,
             SFTPTransfer.FOLLOW_SYMLINK,
-            SFTPTransfer.FILE_FILTER_REGEX,
-            SFTPTransfer.PATH_FILTER_REGEX,
+            FILE_FILTER_REGEX,
+            PATH_FILTER_REGEX,
             SFTPTransfer.IGNORE_DOTTED_FILES,
             SFTPTransfer.STRICT_HOST_KEY_CHECKING,
             SFTPTransfer.HOST_KEY_FILE,
@@ -424,6 +497,21 @@ public class ListSFTPExtended extends ListFileTransfer {
         return listing.stream().anyMatch(info -> !info.isDirectory());
     }
 
+    /**
+     * Resolves a regex filter property against the supplied FlowFile attributes and compiles it. Returns {@code null}
+     * (meaning "no filter") when the property is unset or its resolved value is empty/blank.
+     */
+    static Pattern compileFilterOrNull(final PropertyValue property, final Map<String, String> elAttributes) {
+        if (!property.isSet()) {
+            return null;
+        }
+        final String value = property.evaluateAttributeExpressions(elAttributes).getValue();
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return Pattern.compile(value);
+    }
+
     private static class FlowFileAwareProcessContext implements ProcessContext {
         private final ProcessContext delegate;
         private final ThreadLocal<Map<String, String>> attributeSnapshot;
@@ -435,21 +523,21 @@ public class ListSFTPExtended extends ListFileTransfer {
 
         @Override
         public PropertyValue getProperty(final PropertyDescriptor descriptor) {
-            final PropertyDescriptor resolvedDescriptor;
-            if (PASSWORD.getName().equals(descriptor.getName())) {
-                resolvedDescriptor = PASSWORD;
-            } else if (REMOTE_PATH.getName().equals(descriptor.getName())) {
-                resolvedDescriptor = REMOTE_PATH;
-            } else {
-                resolvedDescriptor = descriptor;
-            }
+            final PropertyDescriptor resolvedDescriptor = descriptor == null
+                    ? null
+                    : OVERRIDDEN_DESCRIPTORS_BY_NAME.getOrDefault(descriptor.getName(), descriptor);
             final PropertyValue delegateValue = delegate.getProperty(resolvedDescriptor);
             final Map<String, String> attrs = attributeSnapshot.get();
+            PropertyValue value = delegateValue;
             if (attrs != null && !attrs.isEmpty()
+                    && resolvedDescriptor != null
                     && resolvedDescriptor.getExpressionLanguageScope() == ExpressionLanguageScope.FLOWFILE_ATTRIBUTES) {
-                return delegateValue.evaluateAttributeExpressions(attrs);
+                value = delegateValue.evaluateAttributeExpressions(attrs);
             }
-            return delegateValue;
+            if (resolvedDescriptor != null && BLANK_AS_UNSET_PROPERTY_NAMES.contains(resolvedDescriptor.getName())) {
+                value = SftpBlankAsUnsetSupport.blankAsUnset(value);
+            }
+            return value;
         }
 
         @Override

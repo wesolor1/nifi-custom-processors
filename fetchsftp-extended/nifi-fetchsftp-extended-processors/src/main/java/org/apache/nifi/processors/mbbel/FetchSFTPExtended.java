@@ -24,6 +24,8 @@ import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.processor.ProcessContext;
+import org.apache.nifi.processor.util.file.transfer.FileTransfer;
 import org.apache.nifi.processors.standard.FetchSFTP;
 import org.apache.nifi.processors.standard.GetFTP;
 import org.apache.nifi.processors.standard.GetSFTP;
@@ -38,7 +40,9 @@ import java.util.List;
 @Tags({"sftp", "get", "retrieve", "files", "fetch", "remote", "ingest", "source", "input"})
 @CapabilityDescription("Fetches the content of a file from a remote SFTP server and overwrites the contents of an incoming FlowFile with the content of the remote file. "
         + "This is a drop-in variant of FetchSFTP where the Password property is NOT marked sensitive, allowing the password to be supplied in plain text "
-        + "or via Expression Language referencing FlowFile attributes. All other behavior is identical to the standard FetchSFTP processor.")
+        + "or via Expression Language referencing FlowFile attributes. When the resolved Password, Private Key Path, or Private Key Passphrase is blank, "
+        + "it is treated as unset so the other credential can be used for dynamic password or public-key authentication. "
+        + "All other behavior is identical to the standard FetchSFTP processor.")
 @SeeAlso({FetchSFTP.class, GetSFTP.class, PutSFTP.class, GetFTP.class, PutFTP.class})
 @WritesAttributes({
         @WritesAttribute(attribute = "sftp.remote.host", description = "The hostname or IP address from which the file was pulled"),
@@ -73,5 +77,10 @@ public class FetchSFTPExtended extends FetchSFTP {
             }
         }
         return descriptors;
+    }
+
+    @Override
+    protected FileTransfer createFileTransfer(final ProcessContext context) {
+        return new SFTPTransfer(SftpBlankAsUnsetSupport.blankAsUnsetContext(context), getLogger());
     }
 }

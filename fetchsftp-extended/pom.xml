@@ -35,6 +35,7 @@
     <packaging>pom</packaging>
 
     <modules>
+        <module>../sftp-extended-common/nifi-sftp-extended-common</module>
         <module>nifi-fetchsftp-extended-processors</module>
         <module>nifi-fetchsftp-extended-nar</module>
     </modules>

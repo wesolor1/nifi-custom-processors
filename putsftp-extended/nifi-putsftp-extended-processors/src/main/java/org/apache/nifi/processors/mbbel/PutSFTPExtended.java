@@ -23,6 +23,7 @@ import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processors.standard.FetchSFTP;
 import org.apache.nifi.processors.standard.GetSFTP;
 import org.apache.nifi.processors.standard.PutSFTP;
@@ -36,6 +37,9 @@ import java.util.List;
 @Tags({"remote", "copy", "egress", "put", "sftp", "archive", "files"})
 @CapabilityDescription("Sends FlowFiles to an SFTP Server. This is a drop-in variant of PutSFTP where the Password property is NOT marked sensitive, "
         + "allowing the password to be supplied in plain text or via Expression Language referencing FlowFile attributes. "
+        + "In addition, when the resolved Password, Private Key Path, or Private Key Passphrase is blank, it is treated as if it were not set. "
+        + "This makes authentication fully dynamic: supply a password and leave the private key blank to use password authentication, or "
+        + "supply a private key and leave the password blank to use public key authentication - without separate processors or branching. "
         + "All other behavior is identical to the standard PutSFTP processor.")
 @SeeAlso({PutSFTP.class, GetSFTP.class, FetchSFTP.class})
 public class PutSFTPExtended extends PutSFTP {
@@ -63,5 +67,10 @@ public class PutSFTPExtended extends PutSFTP {
             }
         }
         return descriptors;
+    }
+
+    @Override
+    protected SFTPTransfer getFileTransfer(final ProcessContext context) {
+        return new SFTPTransfer(SftpBlankAsUnsetSupport.blankAsUnsetContext(context), getLogger());
     }
 }

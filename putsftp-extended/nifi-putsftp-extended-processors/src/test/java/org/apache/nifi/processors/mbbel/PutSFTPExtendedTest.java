@@ -19,16 +19,21 @@ package org.apache.nifi.processors.mbbel;
 import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processors.standard.PutSFTP;
 import org.apache.nifi.processors.standard.util.SFTPTransfer;
+import org.apache.nifi.util.TestRunner;
+import org.apache.nifi.util.TestRunners;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class PutSFTPExtendedTest {
@@ -84,6 +89,60 @@ public class PutSFTPExtendedTest {
         final InputRequirement requirement = PutSFTPExtended.class.getAnnotation(InputRequirement.class);
         assertNotNull(requirement, "@InputRequirement should be present on PutSFTPExtended");
         assertEquals(Requirement.INPUT_REQUIRED, requirement.value());
+    }
+
+    @Test
+    public void testBlankPasswordResolvesToNullSoKeyAuthCanBeUsed() {
+        final TestRunner runner = TestRunners.newTestRunner(new PutSFTPExtended());
+        runner.setProperty(SFTPTransfer.HOSTNAME, "host");
+        runner.setProperty(SFTPTransfer.PORT, "22");
+        runner.setProperty(SFTPTransfer.USERNAME, "user");
+        runner.setProperty(PutSFTPExtended.PASSWORD, "${target_password}");
+        runner.setProperty(SFTPTransfer.PRIVATE_KEY_PATH, "${target_private_key_path}");
+
+        final ProcessContext sanitized = SftpBlankAsUnsetSupport.blankAsUnsetContext(runner.getProcessContext());
+
+        // Empty attribute -> blank EL result -> treated as unset (null), matching StandardSshClientProvider's != null check.
+        final String password = sanitized.getProperty(SFTPTransfer.PASSWORD)
+                .evaluateAttributeExpressions(Map.of("target_private_key_path", "/opt/nifi/keys/key.pem")).getValue();
+        assertNull(password, "Blank password must resolve to null so no empty password identity is added");
+
+        final String privateKeyPath = sanitized.getProperty(SFTPTransfer.PRIVATE_KEY_PATH)
+                .evaluateAttributeExpressions(Map.of("target_private_key_path", "/opt/nifi/keys/key.pem")).getValue();
+        assertEquals("/opt/nifi/keys/key.pem", privateKeyPath, "Populated private key path must be preserved");
+    }
+
+    @Test
+    public void testBlankPrivateKeyResolvesToNullSoPasswordAuthCanBeUsed() {
+        final TestRunner runner = TestRunners.newTestRunner(new PutSFTPExtended());
+        runner.setProperty(SFTPTransfer.HOSTNAME, "host");
+        runner.setProperty(SFTPTransfer.PORT, "22");
+        runner.setProperty(SFTPTransfer.USERNAME, "user");
+        runner.setProperty(PutSFTPExtended.PASSWORD, "${target_password}");
+        runner.setProperty(SFTPTransfer.PRIVATE_KEY_PATH, "${target_private_key_path}");
+
+        final ProcessContext sanitized = SftpBlankAsUnsetSupport.blankAsUnsetContext(runner.getProcessContext());
+        final Map<String, String> attributes = Map.of("target_password", "secret");
+
+        final String password = sanitized.getProperty(SFTPTransfer.PASSWORD)
+                .evaluateAttributeExpressions(attributes).getValue();
+        assertEquals("secret", password, "Populated password must be preserved");
+
+        final String privateKeyPath = sanitized.getProperty(SFTPTransfer.PRIVATE_KEY_PATH)
+                .evaluateAttributeExpressions(attributes).getValue();
+        assertNull(privateKeyPath, "Blank private key path must resolve to null so no empty key provider is configured");
+    }
+
+    @Test
+    public void testNonAuthPropertyIsNotAlteredByBlankSanitization() {
+        final TestRunner runner = TestRunners.newTestRunner(new PutSFTPExtended());
+        runner.setProperty(SFTPTransfer.HOSTNAME, "host");
+        runner.setProperty(SFTPTransfer.PORT, "22");
+        runner.setProperty(SFTPTransfer.USERNAME, "user");
+
+        final ProcessContext sanitized = SftpBlankAsUnsetSupport.blankAsUnsetContext(runner.getProcessContext());
+        assertEquals("host", sanitized.getProperty(SFTPTransfer.HOSTNAME).evaluateAttributeExpressions(Map.of()).getValue());
+        assertEquals("user", sanitized.getProperty(SFTPTransfer.USERNAME).evaluateAttributeExpressions(Map.of()).getValue());
     }
 
     @Test

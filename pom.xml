@@ -11,6 +11,7 @@
     <description>Aggregator for custom NiFi extension bundles in this repository.</description>
 
     <modules>
+        <module>sftp-extended-common</module>
         <module>listsmb-extended</module>
         <module>listsftp-extended</module>
         <module>fetchsftp-extended</module>

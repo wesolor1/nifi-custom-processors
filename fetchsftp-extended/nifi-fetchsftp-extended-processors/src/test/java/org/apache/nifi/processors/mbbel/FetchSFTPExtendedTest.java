@@ -19,16 +19,21 @@ package org.apache.nifi.processors.mbbel;
 import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processors.standard.FetchSFTP;
 import org.apache.nifi.processors.standard.util.SFTPTransfer;
+import org.apache.nifi.util.TestRunner;
+import org.apache.nifi.util.TestRunners;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class FetchSFTPExtendedTest {
@@ -84,6 +89,41 @@ public class FetchSFTPExtendedTest {
         final InputRequirement requirement = FetchSFTPExtended.class.getAnnotation(InputRequirement.class);
         assertNotNull(requirement, "@InputRequirement should be present on FetchSFTPExtended");
         assertEquals(Requirement.INPUT_REQUIRED, requirement.value());
+    }
+
+    @Test
+    public void testBlankPasswordResolvesToNullSoKeyAuthCanBeUsed() {
+        final TestRunner runner = TestRunners.newTestRunner(new FetchSFTPExtended());
+        runner.setProperty(SFTPTransfer.HOSTNAME, "host");
+        runner.setProperty(SFTPTransfer.PORT, "22");
+        runner.setProperty(SFTPTransfer.USERNAME, "user");
+        runner.setProperty(FetchSFTPExtended.PASSWORD, "${target_password}");
+        runner.setProperty(SFTPTransfer.PRIVATE_KEY_PATH, "${target_private_key_path}");
+
+        final ProcessContext sanitized = SftpBlankAsUnsetSupport.blankAsUnsetContext(runner.getProcessContext());
+
+        assertNull(sanitized.getProperty(SFTPTransfer.PASSWORD)
+                .evaluateAttributeExpressions(Map.of("target_private_key_path", "/opt/nifi/keys/key.pem")).getValue());
+        assertEquals("/opt/nifi/keys/key.pem", sanitized.getProperty(SFTPTransfer.PRIVATE_KEY_PATH)
+                .evaluateAttributeExpressions(Map.of("target_private_key_path", "/opt/nifi/keys/key.pem")).getValue());
+    }
+
+    @Test
+    public void testBlankPrivateKeyResolvesToNullSoPasswordAuthCanBeUsed() {
+        final TestRunner runner = TestRunners.newTestRunner(new FetchSFTPExtended());
+        runner.setProperty(SFTPTransfer.HOSTNAME, "host");
+        runner.setProperty(SFTPTransfer.PORT, "22");
+        runner.setProperty(SFTPTransfer.USERNAME, "user");
+        runner.setProperty(FetchSFTPExtended.PASSWORD, "${target_password}");
+        runner.setProperty(SFTPTransfer.PRIVATE_KEY_PATH, "${target_private_key_path}");
+
+        final ProcessContext sanitized = SftpBlankAsUnsetSupport.blankAsUnsetContext(runner.getProcessContext());
+        final Map<String, String> attributes = Map.of("target_password", "secret");
+
+        assertEquals("secret", sanitized.getProperty(SFTPTransfer.PASSWORD)
+                .evaluateAttributeExpressions(attributes).getValue());
+        assertNull(sanitized.getProperty(SFTPTransfer.PRIVATE_KEY_PATH)
+                .evaluateAttributeExpressions(attributes).getValue());
     }
 
     @Test

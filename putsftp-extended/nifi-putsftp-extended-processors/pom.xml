@@ -19,6 +19,12 @@
             <scope>provided</scope>
         </dependency>
 
+        <dependency>
+            <groupId>org.apache.nifi</groupId>
+            <artifactId>nifi-sftp-extended-common</artifactId>
+            <version>2.9.0</version>
+        </dependency>
+
         <!-- Must be PROVIDED so they are not bundled inside the final NAR -->
         <dependency>
             <groupId>org.apache.nifi</groupId>

@@ -226,6 +226,63 @@ public class ListSFTPExtendedTest {
                 "ListSFTPExtended PASSWORD descriptor should override stock SFTPTransfer.PASSWORD to be non-sensitive");
     }
 
+    @Test
+    public void testFileAndPathFilterSupportFlowFileAttributesExpressionLanguage() {
+        assertEquals(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES,
+                ListSFTPExtended.FILE_FILTER_REGEX.getExpressionLanguageScope());
+        assertEquals(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES,
+                ListSFTPExtended.PATH_FILTER_REGEX.getExpressionLanguageScope());
+    }
+
+    @Test
+    public void testFileAndPathFilterAcceptExpressionLanguageWithoutValidationError() throws Exception {
+        final TestRunner runner = newRunner(new ListSFTPExtended());
+        runner.setProperty(ListSFTPExtended.FILE_FILTER_REGEX, "${file_filter}");
+        runner.setProperty(ListSFTPExtended.PATH_FILTER_REGEX, "${path_filter}");
+        runner.assertValid();
+    }
+
+    @Test
+    public void testBlankResolvedFilterIsIgnored() throws Exception {
+        final TestRunner runner = newRunner(new ListSFTPExtended());
+        runner.setProperty(ListSFTPExtended.FILE_FILTER_REGEX, "${file_filter}");
+        final var context = runner.getProcessContext();
+        final var fileFilter = context.getProperty(ListSFTPExtended.FILE_FILTER_REGEX);
+
+        assertNull(ListSFTPExtended.compileFilterOrNull(fileFilter, Map.of()));
+        assertNull(ListSFTPExtended.compileFilterOrNull(fileFilter, Map.of("file_filter", "")));
+        assertNotNull(ListSFTPExtended.compileFilterOrNull(fileFilter, Map.of("file_filter", "te.*")));
+    }
+
+    @Test
+    public void testBlankPasswordResolvesToNullSoKeyAuthCanBeUsed() throws Exception {
+        final TestRunner runner = newRunner(new ListSFTPExtended());
+        runner.setProperty(ListSFTPExtended.PASSWORD, "${target_password}");
+        runner.setProperty(SFTPTransfer.PRIVATE_KEY_PATH, "${target_private_key_path}");
+
+        final ProcessContext sanitized = SftpBlankAsUnsetSupport.blankAsUnsetContext(runner.getProcessContext());
+
+        assertNull(sanitized.getProperty(SFTPTransfer.PASSWORD)
+                .evaluateAttributeExpressions(Map.of("target_private_key_path", "/opt/nifi/keys/key.pem")).getValue());
+        assertEquals("/opt/nifi/keys/key.pem", sanitized.getProperty(SFTPTransfer.PRIVATE_KEY_PATH)
+                .evaluateAttributeExpressions(Map.of("target_private_key_path", "/opt/nifi/keys/key.pem")).getValue());
+    }
+
+    @Test
+    public void testBlankPrivateKeyResolvesToNullSoPasswordAuthCanBeUsed() throws Exception {
+        final TestRunner runner = newRunner(new ListSFTPExtended());
+        runner.setProperty(ListSFTPExtended.PASSWORD, "${target_password}");
+        runner.setProperty(SFTPTransfer.PRIVATE_KEY_PATH, "${target_private_key_path}");
+
+        final ProcessContext sanitized = SftpBlankAsUnsetSupport.blankAsUnsetContext(runner.getProcessContext());
+        final Map<String, String> attributes = Map.of("target_password", "secret");
+
+        assertEquals("secret", sanitized.getProperty(SFTPTransfer.PASSWORD)
+                .evaluateAttributeExpressions(attributes).getValue());
+        assertNull(sanitized.getProperty(SFTPTransfer.PRIVATE_KEY_PATH)
+                .evaluateAttributeExpressions(attributes).getValue());
+    }
+
     // -----------------------------------------------------------------
     // Runtime behavior tests (drive onTrigger with TestRunner)
     // -----------------------------------------------------------------
