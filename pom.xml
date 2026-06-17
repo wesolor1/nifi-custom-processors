@@ -16,6 +16,7 @@
         <module>listsftp-extended</module>
         <module>fetchsftp-extended</module>
         <module>putsftp-extended</module>
+        <module>deletesftp-extended</module>
         <module>lists3-extended</module>
         <module>putsmbfile-extended</module>
         <module>listazuredatalake-extended</module>
