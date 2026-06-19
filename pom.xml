@@ -12,14 +12,14 @@
 
     <modules>
         <module>sftp-extended-common</module>
-        <module>listsmb-extended</module>
+        <module>smb-extended</module>
         <module>listsftp-extended</module>
         <module>fetchsftp-extended</module>
         <module>putsftp-extended</module>
         <module>deletesftp-extended</module>
         <module>lists3-extended</module>
         <module>putsmbfile-extended</module>
-        <module>listazuredatalake-extended</module>
+        <module>azure-datalake-extended</module>
         <module>finxact-websocket-listener</module>
         <module>websocket-listener</module>
     </modules>
