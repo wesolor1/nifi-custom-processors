@@ -72,12 +72,12 @@ public class ListAzureDataLakeStorageExtendedTest {
         volatile boolean listingPerformed = false;
         volatile String resolvedFileSystem;
         volatile boolean emitFlowFile = true;
-        volatile boolean remoteHasFiles = true;
+        volatile boolean hasMatchingResults = true;
         volatile RuntimeException listingException;
 
         @Override
-        protected boolean remoteHasFileEntries(final ProcessContext context) {
-            return remoteHasFiles;
+        protected boolean hasMatchingListingResults(final ProcessContext context) {
+            return hasMatchingResults;
         }
 
         @Override
@@ -239,7 +239,7 @@ public class ListAzureDataLakeStorageExtendedTest {
     public void testEmptyDirectoryRoutesZeroRecordFlowFileToNoFiles() throws InitializationException {
         final TestableListAzureDataLakeStorageExtended processor = new TestableListAzureDataLakeStorageExtended();
         processor.emitFlowFile = false;
-        processor.remoteHasFiles = false;
+        processor.hasMatchingResults = false;
         final TestRunner runner = newRunner(processor);
         runner.setProperty(AzureStorageUtils.FILESYSTEM, "my-filesystem");
 
@@ -269,7 +269,7 @@ public class ListAzureDataLakeStorageExtendedTest {
     public void testNoFilesIsNotEmittedWithoutRecordWriter() throws InitializationException {
         final TestableListAzureDataLakeStorageExtended processor = new TestableListAzureDataLakeStorageExtended();
         processor.emitFlowFile = false;
-        processor.remoteHasFiles = false;
+        processor.hasMatchingResults = false;
         final TestRunner runner = newRunner(processor);
         runner.setProperty(AzureStorageUtils.FILESYSTEM, "my-filesystem");
 
@@ -278,6 +278,25 @@ public class ListAzureDataLakeStorageExtendedTest {
 
         runner.assertTransferCount(ListAzureDataLakeStorageExtended.REL_NO_FILES, 0);
         runner.assertTransferCount(ListAzureDataLakeStorageExtended.REL_FAILURE, 0);
+    }
+
+    @Test
+    public void testNoFilesIsNotEmittedWhenListingProducesFiles() throws InitializationException {
+        final TestableListAzureDataLakeStorageExtended processor = new TestableListAzureDataLakeStorageExtended();
+        processor.hasMatchingResults = true;
+        final TestRunner runner = newRunner(processor);
+        runner.setProperty(AzureStorageUtils.FILESYSTEM, "my-filesystem");
+
+        final MockRecordWriter writerFactory = new MockRecordWriter(null, false);
+        runner.addControllerService("record-writer", writerFactory);
+        runner.enableControllerService(writerFactory);
+        runner.setProperty(ListAzureDataLakeStorageExtended.RECORD_WRITER, "record-writer");
+
+        runner.enqueue("trigger".getBytes());
+        runner.run();
+
+        runner.assertTransferCount(ListAzureDataLakeStorageExtended.REL_SUCCESS, 1);
+        runner.assertTransferCount(ListAzureDataLakeStorageExtended.REL_NO_FILES, 0);
     }
 
     @Test

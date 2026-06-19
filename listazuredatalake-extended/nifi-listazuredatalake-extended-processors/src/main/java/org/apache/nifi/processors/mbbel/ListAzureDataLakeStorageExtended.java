@@ -118,8 +118,9 @@ import static org.apache.nifi.processors.azure.storage.utils.AzureStorageUtils.g
         + "FlowFile (listing attributes take precedence when names overlap). The trigger FlowFile is removed so it is not emitted again "
         + "with the listing results. When no incoming connection is present, the processor behaves like the standard "
         + "ListAzureDataLakeStorage and lists on its schedule. When the listing fails (e.g. the directory does not exist or the "
-        + "credentials are invalid), an error FlowFile is routed to the 'Failure' relationship. When the listed directory contains no "
-        + "file entries at all, a zero-record FlowFile is routed to the 'No Files' relationship (requires Record Writer). "
+        + "credentials are invalid), an error FlowFile is routed to the 'Failure' relationship. When a Record Writer is configured, "
+        + "a zero-record FlowFile is routed to 'No Files' only when the listing yields no matching files after filters are applied "
+        + "(including an empty directory). "
         + "Note: unlike the standard processor, this variant is not annotated "
         + "@PrimaryNodeOnly so that it can be driven by an upstream connection; when running on a cluster without an incoming "
         + "connection, set the Execution Node to 'Primary Node' to avoid duplicate listings.")
@@ -148,7 +149,8 @@ public class ListAzureDataLakeStorageExtended extends AbstractListAzureProcessor
 
     public static final Relationship REL_NO_FILES = new Relationship.Builder()
             .name("No Files")
-            .description("A zero-record FlowFile when the listed directory has no file entries after listing (requires Record Writer).")
+            .description("A zero-record FlowFile when the listing yields no matching files after filters are applied "
+                    + "(including an empty directory; requires Record Writer).")
             .build();
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
@@ -321,11 +323,11 @@ public class ListAzureDataLakeStorageExtended extends AbstractListAzureProcessor
     }
 
     /**
-     * Whether the remote directory currently contains any file entry, regardless of filters and listing state.
-     * Exposed as a protected method so tests can stub the remote check.
+     * Whether the current listing configuration would yield at least one matching file (after file/path/age/size
+     * filters). Exposed as a protected method so tests can stub the remote check without contacting Azure.
      */
-    protected boolean remoteHasFileEntries(final ProcessContext context) throws IOException {
-        return !performListing(context, null, ListingMode.EXECUTION, false).isEmpty();
+    protected boolean hasMatchingListingResults(final ProcessContext context) throws IOException {
+        return !performListing(context, null, ListingMode.EXECUTION, true).isEmpty();
     }
 
     private void emitEmptyFlowFileIfNeeded(final ProcessContext context, final ProcessSession session) {
@@ -338,7 +340,7 @@ public class ListAzureDataLakeStorageExtended extends AbstractListAzureProcessor
         }
 
         try {
-            if (remoteHasFileEntries(context)) {
+            if (hasMatchingListingResults(context)) {
                 return;
             }
         } catch (final IOException e) {
@@ -369,7 +371,7 @@ public class ListAzureDataLakeStorageExtended extends AbstractListAzureProcessor
             emptyFlowFile = session.putAllAttributes(emptyFlowFile, attributes);
 
             session.transfer(emptyFlowFile, REL_NO_FILES);
-            getLogger().debug("Emitted zero-record FlowFile to No Files for empty Azure Data Lake directory.");
+            getLogger().debug("Emitted zero-record FlowFile to No Files because no files matched the listing filters.");
         } catch (final Exception e) {
             getLogger().error("Failed to write empty listing FlowFile due to an error.", e);
             session.remove(emptyFlowFile);
@@ -514,7 +516,7 @@ public class ListAzureDataLakeStorageExtended extends AbstractListAzureProcessor
             final boolean includeTempFiles = context.getProperty(INCLUDE_TEMPORARY_FILES).asBoolean();
             final long minimumTimestamp = minTimestamp == null ? 0 : minTimestamp;
 
-            return fileSystemClient.listPaths(options, null).stream()
+            final List<ADLSFileInfo> listing = fileSystemClient.listPaths(options, null).stream()
                     .filter(pathItem -> !pathItem.isDirectory())
                     .filter(pathItem -> includeTempFiles || !pathItem.getName().contains(TEMP_FILE_DIRECTORY))
                     .filter(pathItem -> isFileInfoMatchesWithAgeAndSize(context, minimumTimestamp, pathItem.getLastModified().toInstant().toEpochMilli(), pathItem.getContentLength()))
@@ -525,7 +527,13 @@ public class ListAzureDataLakeStorageExtended extends AbstractListAzureProcessor
                             .lastModified(pathItem.getLastModified().toInstant().toEpochMilli())
                             .etag(pathItem.getETag())
                             .build())
-                    .filter(fileInfo -> applyFilters)
+                    .toList();
+
+            if (!applyFilters) {
+                return listing;
+            }
+
+            return listing.stream()
                     .filter(fileInfo -> filePattern == null || filePattern.matcher(fileInfo.getFilename()).matches())
                     .filter(fileInfo -> pathPattern == null || pathPattern.matcher(RegExUtils.removeFirst((CharSequence) fileInfo.getDirectory(), baseDirectoryPattern)).matches())
                     .toList();
