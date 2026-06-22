@@ -21,6 +21,7 @@ import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.behavior.PrimaryNodeOnly;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.PropertyValue;
 import org.apache.nifi.controller.AbstractControllerService;
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
@@ -156,8 +157,41 @@ public class ListAzureDataLakeStorageExtendedTest {
 
         assertEquals(base.size(), extended.size(), "Extended processor must expose the same set of properties");
         for (int i = 0; i < base.size(); i++) {
-            assertEquals(base.get(i), extended.get(i), "Property ordering and definitions must match the stock processor");
+            final PropertyDescriptor baseDescriptor = base.get(i);
+            final PropertyDescriptor extendedDescriptor = extended.get(i);
+            assertEquals(baseDescriptor.getName(), extendedDescriptor.getName(),
+                    "Property ordering and names must match the stock processor");
+            if (ListAzureDataLakeStorageExtended.FILE_FILTER.getName().equals(baseDescriptor.getName())
+                    || ListAzureDataLakeStorageExtended.PATH_FILTER.getName().equals(baseDescriptor.getName())) {
+                assertEquals(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES, extendedDescriptor.getExpressionLanguageScope(),
+                        "Filter properties must support FlowFile-attribute Expression Language");
+            } else {
+                assertEquals(baseDescriptor, extendedDescriptor, "Property definitions must match the stock processor");
+            }
         }
+    }
+
+    @Test
+    public void testFileFilterSupportsFlowFileAttributesExpressionLanguage() {
+        final ListAzureDataLakeStorageExtended processor = new ListAzureDataLakeStorageExtended();
+        assertEquals(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES,
+                exposedDescriptor(processor, ListAzureDataLakeStorageExtended.FILE_FILTER.getName()).getExpressionLanguageScope());
+        assertEquals(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES,
+                exposedDescriptor(processor, ListAzureDataLakeStorageExtended.PATH_FILTER.getName()).getExpressionLanguageScope());
+    }
+
+    @Test
+    public void testFileFilterExpressionLanguageResolvedFromTriggerAttributes() throws InitializationException {
+        final TestRunner runner = newRunner(new ListAzureDataLakeStorageExtended());
+        runner.setProperty(AzureStorageUtils.FILESYSTEM, "my-filesystem");
+        runner.setProperty(ListAzureDataLakeStorageExtended.FILE_FILTER, "${source_trigger_filename}");
+
+        final PropertyValue fileFilter = runner.getProcessContext().getProperty(ListAzureDataLakeStorageExtended.FILE_FILTER);
+        assertNull(ListAzureDataLakeStorageExtended.compileFilterOrNull(fileFilter, Map.of()));
+        assertNull(ListAzureDataLakeStorageExtended.compileFilterOrNull(fileFilter, Map.of("source_trigger_filename", "")));
+        assertNotNull(ListAzureDataLakeStorageExtended.compileFilterOrNull(fileFilter, Map.of("source_trigger_filename", "^export.done")));
+        assertTrue(ListAzureDataLakeStorageExtended.compileFilterOrNull(fileFilter, Map.of("source_trigger_filename", "^export.done"))
+                .matcher("export.done").matches());
     }
 
     @Test

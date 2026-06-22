@@ -34,10 +34,13 @@ import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
 import org.apache.nifi.annotation.lifecycle.OnStopped;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.components.PropertyValue;
 import org.apache.nifi.components.ValidationContext;
 import org.apache.nifi.components.ValidationResult;
+import org.apache.nifi.components.Validator;
 import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.context.PropertyContext;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.migration.PropertyConfiguration;
 import org.apache.nifi.processor.ProcessContext;
@@ -77,9 +80,7 @@ import static org.apache.nifi.processor.util.list.ListedEntityTracker.INITIAL_LI
 import static org.apache.nifi.processor.util.list.ListedEntityTracker.TRACKING_STATE_CACHE;
 import static org.apache.nifi.processor.util.list.ListedEntityTracker.TRACKING_TIME_WINDOW;
 import static org.apache.nifi.processors.azure.AbstractAzureDataLakeStorageProcessor.TEMP_FILE_DIRECTORY;
-import static org.apache.nifi.processors.azure.storage.ListAzureDataLakeStorage.FILE_FILTER;
 import static org.apache.nifi.processors.azure.storage.ListAzureDataLakeStorage.INCLUDE_TEMPORARY_FILES;
-import static org.apache.nifi.processors.azure.storage.ListAzureDataLakeStorage.PATH_FILTER;
 import static org.apache.nifi.processors.azure.storage.ListAzureDataLakeStorage.RECURSE_SUBDIRECTORIES;
 import static org.apache.nifi.processors.azure.storage.utils.ADLSAttributes.ATTR_DESCRIPTION_DIRECTORY;
 import static org.apache.nifi.processors.azure.storage.utils.ADLSAttributes.ATTR_DESCRIPTION_ETAG;
@@ -120,6 +121,8 @@ import static org.apache.nifi.processors.azure.storage.utils.AzureStorageUtils.g
         + "and are copied onto every emitted listing FlowFile (listing attributes take precedence when names overlap). The trigger FlowFile "
         + "is removed so it is not emitted again with the listing results. Use ADLSCredentialsControllerServiceExtended when the storage "
         + "account name must be driven by trigger attributes (for example ${source_storage_account}). "
+        + "File Filter and Path Filter support Expression Language against trigger FlowFile attributes; blank resolved "
+        + "filter values are ignored. "
         + "When no incoming connection is present, the processor behaves like the standard "
         + "ListAzureDataLakeStorage and lists on its schedule. When the listing fails (e.g. the directory does not exist or the "
         + "credentials are invalid), an error FlowFile is routed to the 'Failure' relationship. When a Record Writer is configured, "
@@ -143,6 +146,65 @@ import static org.apache.nifi.processors.azure.storage.utils.AzureStorageUtils.g
         "where the previous node left off, without duplicating the data.")
 @DefaultSchedule(strategy = SchedulingStrategy.TIMER_DRIVEN, period = "1 min")
 public class ListAzureDataLakeStorageExtended extends AbstractListAzureProcessor<ADLSFileInfo> {
+
+    /**
+     * Regex validator that is aware of Expression Language: when the configured value contains EL (e.g.
+     * {@code ${source_trigger_filename}}) the actual pattern is only known at runtime against FlowFile attributes, so the
+     * literal is not compiled here. A blank value is treated as "no filter" since these properties are optional.
+     */
+    static final Validator EL_AWARE_REGULAR_EXPRESSION_VALIDATOR = (subject, input, context) -> {
+        if (context.isExpressionLanguageSupported(subject) && context.isExpressionLanguagePresent(input)) {
+            return new ValidationResult.Builder()
+                    .subject(subject)
+                    .input(input)
+                    .valid(true)
+                    .explanation("Expression Language present; pattern is evaluated at runtime.")
+                    .build();
+        }
+        if (input == null || input.isBlank()) {
+            return new ValidationResult.Builder()
+                    .subject(subject)
+                    .input(input)
+                    .valid(true)
+                    .explanation("Empty value; no filter will be applied.")
+                    .build();
+        }
+        try {
+            Pattern.compile(input);
+            return new ValidationResult.Builder().subject(subject).input(input).valid(true).build();
+        } catch (final Exception e) {
+            return new ValidationResult.Builder()
+                    .subject(subject)
+                    .input(input)
+                    .valid(false)
+                    .explanation("Not a valid Java Regular Expression: " + e.getMessage())
+                    .build();
+        }
+    };
+
+    /**
+     * Override the stock File Filter descriptor so the pattern can be driven by incoming trigger FlowFile attributes.
+     */
+    public static final PropertyDescriptor FILE_FILTER = new PropertyDescriptor.Builder()
+            .name(ListAzureDataLakeStorage.FILE_FILTER.getName())
+            .displayName(ListAzureDataLakeStorage.FILE_FILTER.getDisplayName())
+            .description(ListAzureDataLakeStorage.FILE_FILTER.getDescription())
+            .required(ListAzureDataLakeStorage.FILE_FILTER.isRequired())
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .addValidator(EL_AWARE_REGULAR_EXPRESSION_VALIDATOR)
+            .build();
+
+    /**
+     * Override the stock Path Filter descriptor so the pattern can be driven by incoming trigger FlowFile attributes.
+     */
+    public static final PropertyDescriptor PATH_FILTER = new PropertyDescriptor.Builder()
+            .name(ListAzureDataLakeStorage.PATH_FILTER.getName())
+            .displayName(ListAzureDataLakeStorage.PATH_FILTER.getDisplayName())
+            .description(ListAzureDataLakeStorage.PATH_FILTER.getDescription())
+            .required(ListAzureDataLakeStorage.PATH_FILTER.isRequired())
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .addValidator(EL_AWARE_REGULAR_EXPRESSION_VALIDATOR)
+            .build();
 
     public static final Relationship REL_FAILURE = new Relationship.Builder()
             .name("Failure")
@@ -187,9 +249,6 @@ public class ListAzureDataLakeStorageExtended extends AbstractListAzureProcessor
             LISTING_STRATEGY
     );
 
-    private volatile Pattern filePattern;
-    private volatile Pattern pathPattern;
-
     private volatile DataLakeServiceClientFactory clientFactory;
 
     /**
@@ -216,15 +275,11 @@ public class ListAzureDataLakeStorageExtended extends AbstractListAzureProcessor
 
     @OnScheduled
     public void onScheduled(final ProcessContext context) {
-        filePattern = getPattern(context, FILE_FILTER);
-        pathPattern = getPattern(context, PATH_FILTER);
         clientFactory = new DataLakeServiceClientFactory(getLogger(), AzureStorageUtils.getProxyOptions(context));
     }
 
     @OnStopped
     public void onStopped() {
-        filePattern = null;
-        pathPattern = null;
         clientFactory = null;
     }
 
@@ -502,8 +557,8 @@ public class ListAzureDataLakeStorageExtended extends AbstractListAzureProcessor
             final String baseDirectory = evaluateDirectoryProperty(DIRECTORY, context, elAttributes);
             final boolean recurseSubdirectories = context.getProperty(RECURSE_SUBDIRECTORIES).asBoolean();
 
-            final Pattern filePattern = listingMode == ListingMode.EXECUTION ? this.filePattern : getPattern(context, FILE_FILTER);
-            final Pattern pathPattern = listingMode == ListingMode.EXECUTION ? this.pathPattern : getPattern(context, PATH_FILTER);
+            final Pattern filePattern = compileFilterOrNull(context.getProperty(FILE_FILTER), elAttributes);
+            final Pattern pathPattern = compileFilterOrNull(context.getProperty(PATH_FILTER), elAttributes);
 
             final ADLSCredentialsService credentialsService = context.getProperty(ADLS_CREDENTIALS_SERVICE).asControllerService(ADLSCredentialsService.class);
 
@@ -551,8 +606,27 @@ public class ListAzureDataLakeStorageExtended extends AbstractListAzureProcessor
         }
     }
 
-    private Pattern getPattern(final ProcessContext context, final PropertyDescriptor filterDescriptor) {
-        String value = context.getProperty(filterDescriptor).evaluateAttributeExpressions().getValue();
-        return value != null ? Pattern.compile(value) : null;
+    /**
+     * Resolves a regex filter property against the supplied FlowFile attributes and compiles it. Returns {@code null}
+     * (meaning "no filter") when the property is unset or its resolved value is empty/blank.
+     */
+    static Pattern compileFilterOrNull(final PropertyValue property, final Map<String, String> elAttributes) {
+        if (!property.isSet()) {
+            return null;
+        }
+        final PropertyValue resolved;
+        if (elAttributes != null && !elAttributes.isEmpty()) {
+            resolved = property.evaluateAttributeExpressions(elAttributes);
+        } else if (property.isExpressionLanguagePresent()) {
+            // FLOWFILE_ATTRIBUTES-scoped filters cannot be resolved until a trigger FlowFile is available.
+            return null;
+        } else {
+            resolved = property.evaluateAttributeExpressions();
+        }
+        final String value = resolved.getValue();
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return Pattern.compile(value);
     }
 }
