@@ -78,8 +78,21 @@ public class ListSFTPExtendedTest {
 
     private static class ExceptionListingSftp extends ListSFTPExtended {
         @Override
+        @SuppressWarnings("unchecked")
         protected List<FileInfo> performListing(final ProcessContext context, final Long minTimestamp, final ListingMode listingMode,
                                                 final boolean applyFilters) throws IOException {
+            // Mirror production: parent AbstractListProcessor swallows IOException; Failure routing relies on
+            // the listingFailure ThreadLocal set during EXECUTION listings.
+            if (listingMode == ListingMode.EXECUTION) {
+                try {
+                    final java.lang.reflect.Field listingFailure = ListSFTPExtended.class.getDeclaredField("listingFailure");
+                    listingFailure.setAccessible(true);
+                    final ThreadLocal<Exception> failure = (ThreadLocal<Exception>) listingFailure.get(this);
+                    failure.set(new IOException("simulated listing failure"));
+                } catch (final ReflectiveOperationException e) {
+                    throw new IOException("Could not record listing failure for test", e);
+                }
+            }
             throw new IOException("simulated listing failure");
         }
     }
@@ -192,6 +205,23 @@ public class ListSFTPExtendedTest {
     @Test
     public void testListingFailureProducesFailureFlowFile() throws Exception {
         assertTrue(new ListSFTPExtended().getRelationships().contains(ListSFTPExtended.REL_FAILURE));
+
+        final TestRunner runner = newRunner(new ExceptionListingSftp());
+        registerWriter(runner);
+
+        runner.enqueue("trigger", Map.of("batch.id", "B-fail"));
+        runner.run(1);
+
+        runner.assertTransferCount(ListSFTPExtended.REL_FAILURE, 1);
+        runner.assertTransferCount(ListSFTPExtended.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListSFTPExtended.REL_NO_FILES, 0);
+
+        final MockFlowFile failure = runner.getFlowFilesForRelationship(ListSFTPExtended.REL_FAILURE).get(0);
+        failure.assertAttributeEquals("batch.id", "B-fail");
+        failure.assertAttributeEquals("error.message", "simulated listing failure");
+        failure.assertAttributeEquals("error.class", IOException.class.getName());
+        failure.assertAttributeEquals("sftp.remote.host", "sftp.example.com");
+        failure.assertAttributeEquals("sftp.remote.path", "/remote/dir");
     }
 
     @Test

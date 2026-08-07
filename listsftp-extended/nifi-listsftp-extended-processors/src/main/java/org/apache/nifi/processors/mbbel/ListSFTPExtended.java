@@ -67,12 +67,17 @@ import java.util.stream.Collectors;
         + "When a Record Writer is configured, a zero-record FlowFile is routed to No Files only when the remote directory has no file entries. "
         + "Password is non-sensitive and supports dynamic authentication: when the resolved Password, Private Key Path, or Private Key Passphrase "
         + "is blank it is treated as unset so the other credential can be used. File Filter Regex and Path Filter Regex support Expression Language "
-        + "against trigger FlowFile attributes; blank resolved filter values are ignored.")
+        + "against trigger FlowFile attributes; blank resolved filter values are ignored. "
+        + "When the remote listing fails (connection error, path not found, etc.), an error FlowFile "
+        + "is routed to Failure with error.message / error.class and SFTP connection attributes.")
 @SeeAlso({FetchSFTP.class, GetSFTP.class, PutSFTP.class})
 @WritesAttributes({
         @WritesAttribute(attribute = "sftp.remote.host", description = "The hostname of the SFTP Server"),
         @WritesAttribute(attribute = "sftp.remote.port", description = "The port that was connected to on the SFTP Server"),
         @WritesAttribute(attribute = "sftp.listing.user", description = "The username of the user that performed the SFTP Listing"),
+        @WritesAttribute(attribute = "sftp.remote.path", description = "The remote directory that was listed (also set on Failure FlowFiles)"),
+        @WritesAttribute(attribute = "error.message", description = "Root-cause message when listing fails (Failure relationship)"),
+        @WritesAttribute(attribute = "error.class", description = "Root-cause exception class when listing fails (Failure relationship)"),
         @WritesAttribute(attribute = ListFile.FILE_OWNER_ATTRIBUTE, description = "The numeric owner id of the source file"),
         @WritesAttribute(attribute = ListFile.FILE_GROUP_ATTRIBUTE, description = "The numeric group id of the source file"),
         @WritesAttribute(attribute = ListFile.FILE_PERMISSIONS_ATTRIBUTE, description = "The read/write/execute permissions of the source file"),
@@ -92,6 +97,14 @@ public class ListSFTPExtended extends ListFileTransfer {
      * Snapshot of the last trigger FlowFile's attributes for EL during listing and for copying onto emitted FlowFiles. Cleared in {@code finally}.
      */
     private final ThreadLocal<Map<String, String>> triggerFlowAttributes = new ThreadLocal<>();
+
+    /**
+     * Set when {@link #performListing} fails during execution. The parent {@code AbstractListProcessor}
+     * swallows {@link IOException} (logs + yields), so Failure routing is detected via this ThreadLocal
+     * rather than the {@code onTrigger} catch block alone.
+     */
+    private final ThreadLocal<Exception> listingFailure = new ThreadLocal<>();
+
     private volatile Predicate<FileInfo> fileFilter;
 
     public static final PropertyDescriptor PASSWORD = new PropertyDescriptor.Builder()
@@ -216,7 +229,8 @@ public class ListSFTPExtended extends ListFileTransfer {
 
     public static final Relationship REL_FAILURE = new Relationship.Builder()
             .name("Failure")
-            .description("Failed processing")
+            .description("An error FlowFile is routed here when the remote listing could not be performed "
+                    + "(e.g. connection failure, authentication error, or remote path not found).")
             .autoTerminateDefault(true)
             .build();
 
@@ -287,16 +301,26 @@ public class ListSFTPExtended extends ListFileTransfer {
     @Override
     protected List<FileInfo> performListing(final ProcessContext context, final Long minTimestamp, final ListingMode listingMode,
                                             final boolean applyFilters) throws IOException {
-        final List<FileInfo> listing = super.performListing(context, minTimestamp, listingMode, applyFilters);
+        try {
+            final List<FileInfo> listing = super.performListing(context, minTimestamp, listingMode, applyFilters);
 
-        if (!applyFilters) {
-            return listing;
+            if (!applyFilters) {
+                return listing;
+            }
+
+            final Predicate<FileInfo> filePredicate = listingMode == ListingMode.EXECUTION ? this.fileFilter : createFileFilter(context);
+            return listing.stream()
+                    .filter(filePredicate)
+                    .collect(Collectors.toList());
+        } catch (final Exception e) {
+            if (listingMode == ListingMode.EXECUTION) {
+                listingFailure.set(e);
+            }
+            if (e instanceof IOException) {
+                throw (IOException) e;
+            }
+            throw new IOException("Could not perform listing", e);
         }
-
-        final Predicate<FileInfo> filePredicate = listingMode == ListingMode.EXECUTION ? this.fileFilter : createFileFilter(context);
-        return listing.stream()
-                .filter(filePredicate)
-                .collect(Collectors.toList());
     }
 
     @OnScheduled
@@ -356,7 +380,18 @@ public class ListSFTPExtended extends ListFileTransfer {
 
         try {
             final ProcessSession listingSession = withTriggerAttributes(session, triggerFlowAttributes.get());
+            // Parent may swallow listing IOExceptions (log + yield); Failure is detected via listingFailure.
             super.onTrigger(context, listingSession);
+
+            final Exception listingError = listingFailure.get();
+            if (listingError != null) {
+                listingFailure.remove();
+                final FlowFile errorFlowFile = createErrorFlowFile(listingSession, context, listingError);
+                if (errorFlowFile != null) {
+                    listingSession.transfer(errorFlowFile, REL_FAILURE);
+                }
+                return;
+            }
 
             emitEmptyFlowFileIfNeeded(context, listingSession);
         } catch (final Exception e) {
@@ -368,6 +403,7 @@ public class ListSFTPExtended extends ListFileTransfer {
                 listingSession.transfer(errorFlowFile, REL_FAILURE);
             }
         } finally {
+            listingFailure.remove();
             triggerFlowAttributes.remove();
         }
     }
@@ -378,21 +414,36 @@ public class ListSFTPExtended extends ListFileTransfer {
         FlowFile errorFlowFile = session.create();
 
         final Map<String, String> attributes = new HashMap<>();
-        attributes.put("error.message", error.getMessage());
-        attributes.put("error.class", error.getClass().getName());
+        final Throwable rootCause = getRootCause(error);
+        attributes.put("error.message", rootCause.getMessage() != null ? rootCause.getMessage() : error.getMessage());
+        attributes.put("error.class", rootCause.getClass().getName());
         final Map<String, String> elAttributes = triggerFlowAttributes.get() != null ? triggerFlowAttributes.get() : Map.of();
-        attributes.put("sftp.remote.host", context.getProperty(SFTPTransfer.HOSTNAME)
-                .evaluateAttributeExpressions(elAttributes).getValue());
-        attributes.put("sftp.remote.port", context.getProperty(SFTPTransfer.PORT)
-                .evaluateAttributeExpressions(elAttributes).getValue());
-        attributes.put("sftp.listing.user", context.getProperty(SFTPTransfer.USERNAME)
-                .evaluateAttributeExpressions(elAttributes).getValue());
+        try {
+            attributes.put("sftp.remote.host", context.getProperty(SFTPTransfer.HOSTNAME)
+                    .evaluateAttributeExpressions(elAttributes).getValue());
+            attributes.put("sftp.remote.port", context.getProperty(SFTPTransfer.PORT)
+                    .evaluateAttributeExpressions(elAttributes).getValue());
+            attributes.put("sftp.listing.user", context.getProperty(SFTPTransfer.USERNAME)
+                    .evaluateAttributeExpressions(elAttributes).getValue());
+            attributes.put("sftp.remote.path", context.getProperty(REMOTE_PATH)
+                    .evaluateAttributeExpressions(elAttributes).getValue());
+        } catch (final Exception attrEx) {
+            getLogger().debug("Could not resolve SFTP connection attributes for error FlowFile: {}", attrEx.getMessage());
+        }
 
         errorFlowFile = session.putAllAttributes(errorFlowFile, attributes);
 
         getLogger().debug("Created error FlowFile with attributes: {}", attributes);
 
         return errorFlowFile;
+    }
+
+    private static Throwable getRootCause(final Throwable throwable) {
+        Throwable rootCause = throwable;
+        while (rootCause.getCause() != null) {
+            rootCause = rootCause.getCause();
+        }
+        return rootCause;
     }
 
     private void copyTriggerAttributes(final Map<String, String> attributes) {
