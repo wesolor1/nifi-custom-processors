@@ -18,6 +18,8 @@ package org.apache.nifi.processors.mbbel;
 
 import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
+import org.apache.nifi.annotation.behavior.PrimaryNodeOnly;
+import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.controller.AbstractControllerService;
 import org.apache.nifi.expression.ExpressionLanguageScope;
@@ -29,6 +31,8 @@ import org.apache.nifi.processors.aws.AbstractAwsProcessor;
 import org.apache.nifi.processors.aws.credentials.provider.AwsCredentialsProviderService;
 import org.apache.nifi.processors.aws.region.RegionUtil;
 import org.apache.nifi.processors.aws.s3.AbstractS3Processor;
+import org.apache.nifi.processors.aws.s3.DeleteS3Object;
+import org.apache.nifi.processors.aws.s3.FetchS3Object;
 import org.apache.nifi.processors.aws.s3.ListS3;
 import org.apache.nifi.reporting.InitializationException;
 import org.apache.nifi.serialization.record.MockRecordWriter;
@@ -39,6 +43,7 @@ import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.auth.credentials.AnonymousCredentialsProvider;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -46,6 +51,7 @@ import java.util.Map;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class ListS3ExtendedTest {
@@ -135,6 +141,16 @@ public class ListS3ExtendedTest {
     }
 
     @Test
+    public void testPrimaryNodeOnlyIsNotInherited() {
+        // @PrimaryNodeOnly is @Inherited and NiFi walks superclasses, which is why this processor
+        // extends AbstractS3Processor directly instead of subclassing the stock ListS3.
+        assertNull(ListS3Extended.class.getAnnotation(PrimaryNodeOnly.class),
+                "ListS3Extended must not be primary-node-only so incoming connections and All Nodes execution are allowed");
+        assertFalse(ListS3.class.isAssignableFrom(ListS3Extended.class),
+                "ListS3Extended must not extend ListS3 or @PrimaryNodeOnly would still be discovered");
+    }
+
+    @Test
     public void testBucketAndPrefixSupportFlowFileAttributesExpressionLanguage() {
         final ListS3Extended processor = new ListS3Extended();
         assertEquals(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES,
@@ -191,9 +207,9 @@ public class ListS3ExtendedTest {
 
         assertTrue(processor.listingPerformed, "Listing should have been performed on the incoming trigger");
         runner.assertQueueEmpty();
-        runner.assertTransferCount(ListS3.REL_SUCCESS, 1);
+        runner.assertTransferCount(ListS3Extended.REL_SUCCESS, 1);
 
-        final MockFlowFile out = runner.getFlowFilesForRelationship(ListS3.REL_SUCCESS).get(0);
+        final MockFlowFile out = runner.getFlowFilesForRelationship(ListS3Extended.REL_SUCCESS).get(0);
         out.assertAttributeEquals("filename", "object-key.txt");
         out.assertAttributeEquals("batch.id", "12345");
         // Listing attribute wins over the trigger attribute on name collision.
@@ -214,17 +230,19 @@ public class ListS3ExtendedTest {
 
         assertEquals("resolved-bucket", processor.resolvedBucket,
                 "Bucket Expression Language should resolve against the trigger FlowFile attributes");
-        final MockFlowFile out = runner.getFlowFilesForRelationship(ListS3.REL_SUCCESS).get(0);
+        final MockFlowFile out = runner.getFlowFilesForRelationship(ListS3Extended.REL_SUCCESS).get(0);
         out.assertAttributeEquals("s3.bucket", "resolved-bucket");
     }
 
     @Test
     public void testRelationshipsIncludeFailureAndNoFiles() {
         final ListS3Extended extended = new ListS3Extended();
-        assertTrue(extended.getRelationships().contains(ListS3Extended.REL_FAILURE),
-                "Extended processor should expose the Failure relationship");
-        assertTrue(extended.getRelationships().contains(ListS3Extended.REL_NO_FILES),
-                "Extended processor should expose the No Files relationship");
+        final List<String> names = extended.getRelationships().stream().map(Relationship::getName).toList();
+        assertTrue(names.contains("success"), "Extended processor should expose the success relationship");
+        assertTrue(names.contains("Failure"), "Extended processor should expose the Failure relationship");
+        assertTrue(names.contains("No Files"), "Extended processor should expose the No Files relationship");
+        assertTrue(extended.getRelationships().contains(ListS3Extended.REL_FAILURE));
+        assertTrue(extended.getRelationships().contains(ListS3Extended.REL_NO_FILES));
     }
 
     @Test
@@ -241,7 +259,7 @@ public class ListS3ExtendedTest {
         runner.run();
 
         runner.assertQueueEmpty();
-        runner.assertTransferCount(ListS3.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListS3Extended.REL_SUCCESS, 0);
         runner.assertTransferCount(ListS3Extended.REL_FAILURE, 1);
 
         final MockFlowFile out = runner.getFlowFilesForRelationship(ListS3Extended.REL_FAILURE).get(0);
@@ -271,7 +289,7 @@ public class ListS3ExtendedTest {
 
         assertFalse(processor.listingPerformed, "The stock listing should be skipped when the bucket is empty");
         runner.assertQueueEmpty();
-        runner.assertTransferCount(ListS3.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListS3Extended.REL_SUCCESS, 0);
         runner.assertTransferCount(ListS3Extended.REL_FAILURE, 0);
         runner.assertTransferCount(ListS3Extended.REL_NO_FILES, 1);
 
@@ -306,6 +324,14 @@ public class ListS3ExtendedTest {
 
         assertFalse(processor.listingPerformed,
                 "With an empty incoming connection the processor should yield instead of listing");
-        runner.assertTransferCount(ListS3.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListS3Extended.REL_SUCCESS, 0);
+    }
+
+    @Test
+    public void testSeeAlsoIncludesStockFetchAndDelete() {
+        final SeeAlso seeAlso = ListS3Extended.class.getAnnotation(SeeAlso.class);
+        assertNotNull(seeAlso);
+        assertTrue(Arrays.asList(seeAlso.value()).contains(FetchS3Object.class));
+        assertTrue(Arrays.asList(seeAlso.value()).contains(DeleteS3Object.class));
     }
 }

@@ -26,18 +26,31 @@ import org.apache.nifi.annotation.configuration.DefaultSchedule;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.annotation.lifecycle.OnScheduled;
+import org.apache.nifi.annotation.lifecycle.OnStopped;
+import org.apache.nifi.annotation.notification.OnPrimaryNodeStateChange;
+import org.apache.nifi.annotation.notification.PrimaryNodeState;
+import org.apache.nifi.components.ConfigVerificationResult;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.PropertyValue;
+import org.apache.nifi.components.ValidationContext;
+import org.apache.nifi.components.ValidationResult;
 import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.components.state.StateManager;
 import org.apache.nifi.controller.ControllerServiceLookup;
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
+import org.apache.nifi.logging.ComponentLog;
+import org.apache.nifi.migration.PropertyConfiguration;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
+import org.apache.nifi.processor.ProcessorInitializationContext;
 import org.apache.nifi.processor.Relationship;
+import org.apache.nifi.processor.VerifiableProcessor;
 import org.apache.nifi.processor.exception.ProcessException;
 import org.apache.nifi.processors.aws.s3.AbstractS3Processor;
+import org.apache.nifi.processors.aws.s3.DeleteS3Object;
+import org.apache.nifi.processors.aws.s3.FetchS3Object;
 import org.apache.nifi.processors.aws.s3.ListS3;
 import org.apache.nifi.scheduling.ExecutionNode;
 import org.apache.nifi.scheduling.SchedulingStrategy;
@@ -54,21 +67,31 @@ import software.amazon.awssdk.services.s3.model.RequestPayer;
 
 import java.io.IOException;
 import java.io.OutputStream;
+import java.lang.annotation.Annotation;
 import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Collections;
 import java.util.HashMap;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+/**
+ * Extended variant of {@link ListS3} that accepts incoming connections. It is implemented as a sibling
+ * (extending {@link AbstractS3Processor} directly) rather than a subclass of the stock processor, because
+ * the stock {@code @PrimaryNodeOnly} annotation is {@code @Inherited} and NiFi also walks the superclass
+ * chain; a primary-node-only processor cannot take incoming connections ("Processors with incoming
+ * connections cannot be scheduled for Primary Node Only") and would starve trigger FlowFiles delivered
+ * to non-primary nodes.
+ */
 @TriggerSerially
 @InputRequirement(Requirement.INPUT_ALLOWED)
 @Tags({"Amazon", "S3", "AWS", "list"})
-@SeeAlso({ListS3.class})
+@SeeAlso({ListS3.class, FetchS3Object.class, DeleteS3Object.class})
 @CapabilityDescription("Retrieves a listing of objects from an S3 bucket. For each object that is listed, creates a FlowFile that represents "
         + "the object so that it can be fetched in conjunction with FetchS3Object. "
         + "This is a drop-in variant of ListS3 that additionally accepts incoming FlowFiles as trigger signals so the listing can be wired "
@@ -78,9 +101,9 @@ import java.util.Set;
         + "the processor behaves like the standard ListS3 and lists on its schedule. Before listing, the bucket is checked with a lightweight "
         + "request: if the check fails (e.g. the bucket does not exist or the credentials are invalid), an error FlowFile is routed to the "
         + "'Failure' relationship; if the bucket contains no objects under the configured prefix, a zero-record FlowFile is routed to the "
-        + "'No Files' relationship (requires Record Writer). Note: unlike the standard ListS3, this variant is not annotated "
-        + "@PrimaryNodeOnly or @TriggerWhenEmpty so that it can be driven by an upstream connection; when running on a cluster without an incoming "
-        + "connection, set the Execution Node to 'Primary Node' to avoid duplicate listings.")
+        + "'No Files' relationship (requires Record Writer). "
+        + "Unlike the standard ListS3, this variant is not primary-node-only, so Execution Node can be 'All Nodes' and incoming connections "
+        + "are allowed. When running on a cluster without an incoming connection, set Execution Node to 'Primary Node' to avoid duplicate listings.")
 @WritesAttributes({
         @WritesAttribute(attribute = "s3.bucket", description = "The name of the S3 bucket"),
         @WritesAttribute(attribute = "s3.region", description = "The region of the S3 bucket"),
@@ -94,13 +117,17 @@ import java.util.Set;
         @WritesAttribute(attribute = "s3.tag.___", description = "If 'Write Object Tags' is set to 'True', the tags associated to the S3 object that is being listed "
                 + "will be written as part of the FlowFile attributes"),
         @WritesAttribute(attribute = "s3.user.metadata.___", description = "If 'Write User Metadata' is set to 'True', the user defined metadata associated to the S3 object that is being listed "
-                + "will be written as part of the FlowFile attributes")})
+                + "will be written as part of the FlowFile attributes"),
+        @WritesAttribute(attribute = "error.message", description = "Root-cause message when listing fails (Failure relationship)"),
+        @WritesAttribute(attribute = "error.class", description = "Root-cause exception class when listing fails (Failure relationship)")})
 @Stateful(scopes = Scope.CLUSTER, description = "After performing a listing of keys, the timestamp of the newest key is stored, "
         + "along with the keys that share that same timestamp. This allows the Processor to list only keys that have been added or modified after "
         + "this date the next time that the Processor is run. State is stored across the cluster so that this Processor can be run on Primary Node only and if a new Primary "
         + "Node is selected, the new node can pick up where the previous node left off, without duplicating the data.")
 @DefaultSchedule(strategy = SchedulingStrategy.TIMER_DRIVEN, period = "1 min")
-public class ListS3Extended extends ListS3 {
+public class ListS3Extended extends AbstractS3Processor implements VerifiableProcessor {
+
+    public static final Relationship REL_SUCCESS = AbstractS3Processor.REL_SUCCESS;
 
     public static final Relationship REL_FAILURE = new Relationship.Builder()
             .name("Failure")
@@ -113,6 +140,15 @@ public class ListS3Extended extends ListS3 {
             .name("No Files")
             .description("A zero-record FlowFile when the bucket has no objects under the configured prefix (requires Record Writer).")
             .build();
+
+    public static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS, REL_FAILURE, REL_NO_FILES);
+
+    /**
+     * Stock ListS3 property list, captured statically so {@link #getSupportedPropertyDescriptors()} is safe
+     * even if invoked during superclass construction (before instance fields are initialized).
+     */
+    private static final List<PropertyDescriptor> STOCK_LIST_S3_DESCRIPTORS =
+            List.copyOf(new ListS3().getPropertyDescriptors());
 
     /**
      * Bucket descriptor overridden so the bucket name can be driven by incoming trigger FlowFile attributes
@@ -141,19 +177,21 @@ public class ListS3Extended extends ListS3 {
      */
     private final ThreadLocal<Map<String, String>> triggerFlowAttributes = new ThreadLocal<>();
 
+    /**
+     * Stock listing implementation. Lives as a sibling instance rather than a superclass so this processor is not
+     * {@code @PrimaryNodeOnly}. Logger / identifier / scheduled state are delegated to this processor.
+     */
+    private final ListingEngine listingEngine = new ListingEngine();
+
     @Override
     public Set<Relationship> getRelationships() {
-        final Set<Relationship> relationships = new HashSet<>(super.getRelationships());
-        relationships.add(REL_FAILURE);
-        relationships.add(REL_NO_FILES);
-        return relationships;
+        return RELATIONSHIPS;
     }
 
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
-        final List<PropertyDescriptor> baseDescriptors = super.getSupportedPropertyDescriptors();
-        final List<PropertyDescriptor> descriptors = new ArrayList<>(baseDescriptors.size());
-        for (final PropertyDescriptor descriptor : baseDescriptors) {
+        final List<PropertyDescriptor> descriptors = new ArrayList<>(STOCK_LIST_S3_DESCRIPTORS.size());
+        for (final PropertyDescriptor descriptor : STOCK_LIST_S3_DESCRIPTORS) {
             if (descriptor.getName().equals(BUCKET.getName())) {
                 descriptors.add(BUCKET);
             } else if (descriptor.getName().equals(PREFIX.getName())) {
@@ -163,6 +201,52 @@ public class ListS3Extended extends ListS3 {
             }
         }
         return descriptors;
+    }
+
+    @Override
+    protected void init(final ProcessorInitializationContext context) {
+        listingEngine.initialize(context);
+    }
+
+    @OnScheduled
+    public void onScheduledListingEngine(final ProcessContext context) {
+        invokeListS3Lifecycle(OnScheduled.class, context);
+    }
+
+    @OnStopped
+    public void onStoppedListingEngine() {
+        invokeHierarchyLifecycle(OnStopped.class);
+    }
+
+    @OnPrimaryNodeStateChange
+    public void onPrimaryNodeChangeListingEngine(final PrimaryNodeState newState) {
+        invokeListS3Lifecycle(OnPrimaryNodeStateChange.class, newState);
+    }
+
+    @Override
+    public void onPropertyModified(final PropertyDescriptor descriptor, final String oldValue, final String newValue) {
+        listingEngine.onPropertyModified(descriptor, oldValue, newValue);
+        super.onPropertyModified(descriptor, oldValue, newValue);
+    }
+
+    @Override
+    public void migrateProperties(final PropertyConfiguration config) {
+        listingEngine.migrateProperties(config);
+        super.migrateProperties(config);
+    }
+
+    @Override
+    protected Collection<ValidationResult> customValidate(final ValidationContext validationContext) {
+        final Collection<ValidationResult> results = new ArrayList<>();
+        results.addAll(super.customValidate(validationContext));
+        results.addAll(listingEngine.exposeCustomValidate(validationContext));
+        return results;
+    }
+
+    @Override
+    public List<ConfigVerificationResult> verify(final ProcessContext context, final ComponentLog verificationLogger,
+                                                 final Map<String, String> attributes) {
+        return listingEngine.verify(context, verificationLogger, attributes);
     }
 
     @Override
@@ -211,10 +295,10 @@ public class ListS3Extended extends ListS3 {
     /**
      * Seam that performs the actual S3 listing. By default this delegates to the stock {@link ListS3#onTrigger}
      * logic. Exposed as a protected method primarily so the trigger-handling and attribute-merging behavior of this
-     * subclass can be unit tested without requiring a live S3 endpoint.
+     * class can be unit tested without requiring a live S3 endpoint.
      */
     protected void performListing(final ProcessContext context, final ProcessSession session) {
-        super.onTrigger(context, session);
+        listingEngine.onTrigger(context, session);
     }
 
     /**
@@ -275,7 +359,7 @@ public class ListS3Extended extends ListS3 {
     }
 
     private void emitEmptyFlowFileIfNeeded(final ProcessContext context, final ProcessSession session) {
-        final RecordSetWriterFactory writerFactory = context.getProperty(RECORD_WRITER)
+        final RecordSetWriterFactory writerFactory = context.getProperty(ListS3.RECORD_WRITER)
                 .asControllerService(RecordSetWriterFactory.class);
 
         if (writerFactory == null) {
@@ -339,6 +423,77 @@ public class ListS3Extended extends ListS3 {
                 ProcessSession.class.getClassLoader(),
                 new Class<?>[] {ProcessSession.class},
                 handler);
+    }
+
+    private void invokeListS3Lifecycle(final Class<? extends Annotation> annotationType, final Object... availableArgs) {
+        invokeLifecycleMethods(ListS3.class.getDeclaredMethods(), annotationType, availableArgs);
+    }
+
+    private void invokeHierarchyLifecycle(final Class<? extends Annotation> annotationType, final Object... availableArgs) {
+        for (Class<?> type = ListS3.class; type != null && type != Object.class; type = type.getSuperclass()) {
+            invokeLifecycleMethods(type.getDeclaredMethods(), annotationType, availableArgs);
+        }
+    }
+
+    private void invokeLifecycleMethods(final Method[] methods, final Class<? extends Annotation> annotationType,
+                                        final Object... availableArgs) {
+        for (final Method method : methods) {
+            if (method.getAnnotation(annotationType) == null) {
+                continue;
+            }
+            final Object[] invokeArgs = bindArgs(method.getParameterTypes(), availableArgs);
+            if (invokeArgs == null) {
+                continue;
+            }
+            method.setAccessible(true);
+            try {
+                method.invoke(listingEngine, invokeArgs);
+            } catch (final InvocationTargetException e) {
+                final Throwable cause = e.getCause() != null ? e.getCause() : e;
+                if (cause instanceof RuntimeException runtimeException) {
+                    throw runtimeException;
+                }
+                if (cause instanceof Error error) {
+                    throw error;
+                }
+                throw new ProcessException("Failed to invoke " + method.getName() + " on listing engine", cause);
+            } catch (final ReflectiveOperationException e) {
+                throw new ProcessException("Failed to invoke " + method.getName() + " on listing engine", e);
+            }
+        }
+    }
+
+    private static Object[] bindArgs(final Class<?>[] paramTypes, final Object[] availableArgs) {
+        if (paramTypes.length == 0) {
+            return new Object[0];
+        }
+        final Object[] bound = new Object[paramTypes.length];
+        for (int i = 0; i < paramTypes.length; i++) {
+            Object match = null;
+            for (final Object arg : availableArgs) {
+                if (arg != null && paramTypes[i].isInstance(arg)) {
+                    match = arg;
+                    break;
+                }
+            }
+            if (match == null) {
+                return null;
+            }
+            bound[i] = match;
+        }
+        return bound;
+    }
+
+    /**
+     * Stock {@link ListS3} used only as a listing engine. Not registered as a NiFi processor; it is
+     * {@link #init(ProcessorInitializationContext) initialized} with the same context as this processor so
+     * identifier and logger are available. That keeps this class off the {@code ListS3} superclass chain
+     * (and therefore not {@code @PrimaryNodeOnly}).
+     */
+    private final class ListingEngine extends ListS3 {
+        Collection<ValidationResult> exposeCustomValidate(final ValidationContext validationContext) {
+            return super.customValidate(validationContext);
+        }
     }
 
     /**

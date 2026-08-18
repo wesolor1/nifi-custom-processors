@@ -34,6 +34,9 @@
     <version>2.9.0</version>
     <packaging>pom</packaging>
 
+    <name>lists3-extended</name>
+    <description>Extended ListS3 processor that accepts incoming trigger FlowFiles.</description>
+
     <modules>
         <module>nifi-lists3-extended-processors</module>
         <module>nifi-lists3-extended-nar</module>
