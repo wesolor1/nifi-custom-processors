@@ -1,0 +1,4 @@
+org.apache.nifi.processors.mbbel.ListS3Extended
+org.apache.nifi.processors.mbbel.PutS3ObjectExtended
+org.apache.nifi.processors.mbbel.FetchS3ObjectExtended
+org.apache.nifi.processors.mbbel.DeleteS3ObjectExtended
