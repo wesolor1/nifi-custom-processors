@@ -28,8 +28,10 @@ import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 
 import java.util.Map;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
 
 public class AWSCredentialsProviderControllerServiceExtendedTest {
 
@@ -70,5 +72,46 @@ public class AWSCredentialsProviderControllerServiceExtendedTest {
 
         assertEquals("resolved-access-key", credentials.accessKeyId());
         assertEquals("resolved-secret-key", credentials.secretAccessKey());
+    }
+
+    @Test
+    public void testGetAwsCredentialsProviderDoesNotResolveKeysUntilResolveCredentials() throws InitializationException {
+        final AWSCredentialsProviderControllerServiceExtended credentialsService = new AWSCredentialsProviderControllerServiceExtended();
+        final TestRunner runner = TestRunners.newTestRunner(ListS3Extended.class);
+
+        runner.addControllerService("aws-creds", credentialsService);
+        runner.setProperty(credentialsService, AWSCredentialsProviderControllerServiceExtended.ACCESS_KEY_ID, "${source_access_key_id}");
+        runner.setProperty(credentialsService, AWSCredentialsProviderControllerServiceExtended.SECRET_KEY, "${source_secret_access_key}");
+        runner.enableControllerService(credentialsService);
+
+        final AwsCredentialsProvider provider = assertDoesNotThrow(credentialsService::getAwsCredentialsProvider,
+                "getAwsCredentialsProvider must not evaluate Access Key ID at onScheduled/client-build time");
+        assertNotNull(provider);
+
+        AWSCredentialsProviderControllerServiceExtended.setEvaluationAttributes(Map.of(
+                "source_access_key_id", "resolved-access-key",
+                "source_secret_access_key", "resolved-secret-key"
+        ));
+
+        final AwsBasicCredentials credentials = (AwsBasicCredentials) provider.resolveCredentials();
+        assertEquals("resolved-access-key", credentials.accessKeyId());
+        assertEquals("resolved-secret-key", credentials.secretAccessKey());
+    }
+
+    @Test
+    public void testLiteralAccessKeysResolveWithoutFlowFileAttributes() throws InitializationException {
+        final AWSCredentialsProviderControllerServiceExtended credentialsService = new AWSCredentialsProviderControllerServiceExtended();
+        final TestRunner runner = TestRunners.newTestRunner(ListS3Extended.class);
+
+        runner.addControllerService("aws-creds", credentialsService);
+        runner.setProperty(credentialsService, AWSCredentialsProviderControllerServiceExtended.ACCESS_KEY_ID, "AKIATESTKEY");
+        runner.setProperty(credentialsService, AWSCredentialsProviderControllerServiceExtended.SECRET_KEY, "test-secret-key");
+        runner.enableControllerService(credentialsService);
+
+        final AwsCredentialsProvider provider = credentialsService.getAwsCredentialsProvider();
+        final AwsBasicCredentials credentials = (AwsBasicCredentials) provider.resolveCredentials();
+
+        assertEquals("AKIATESTKEY", credentials.accessKeyId());
+        assertEquals("test-secret-key", credentials.secretAccessKey());
     }
 }

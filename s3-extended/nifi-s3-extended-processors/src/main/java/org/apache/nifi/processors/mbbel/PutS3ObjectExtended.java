@@ -22,6 +22,7 @@ import org.apache.nifi.annotation.behavior.SupportsBatching;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.exception.ProcessException;
@@ -29,8 +30,10 @@ import org.apache.nifi.processors.aws.credentials.provider.service.AWSCredential
 import org.apache.nifi.processors.aws.s3.PutS3Object;
 import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.core.client.builder.SdkClientBuilder;
 import software.amazon.awssdk.services.s3.S3Client;
 
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -44,11 +47,11 @@ import java.util.Map;
 @InputRequirement(Requirement.INPUT_REQUIRED)
 @Tags({"Amazon", "S3", "AWS", "Archive", "Put"})
 @CapabilityDescription("Puts FlowFiles to an Amazon S3 Bucket. This is a drop-in variant of PutS3Object designed for "
-        + "use with ListS3Extended and AWSCredentialsProviderControllerServiceExtended, where Access Key ID and Secret "
-        + "Access Key can be supplied via Expression Language against incoming FlowFile attributes (for example "
-        + "${source_access_key_id}). Incoming FlowFile attributes are published to the credentials service before the "
-        + "upload so they are available when credentials are resolved. All other behavior is identical to the standard "
-        + "PutS3Object processor.")
+        + "use with ListS3Extended and AWSCredentialsProviderControllerServiceExtended, where Access Key ID, Secret "
+        + "Access Key and Endpoint Override URL can be supplied via Expression Language against incoming FlowFile "
+        + "attributes (for example ${source_access_key_id}, ${source_endpoint_override}). Incoming FlowFile attributes "
+        + "are published to the credentials service before the upload so they are available when credentials are resolved. "
+        + "All other behavior is identical to the standard PutS3Object processor.")
 @SeeAlso({PutS3Object.class, ListS3Extended.class, FetchS3ObjectExtended.class, DeleteS3ObjectExtended.class,
         AWSCredentialsProviderControllerServiceExtended.class})
 public class PutS3ObjectExtended extends PutS3Object {
@@ -58,6 +61,19 @@ public class PutS3ObjectExtended extends PutS3Object {
      * resolves Access Key ID / Secret Access Key. Always cleared in a {@code finally} block around {@link #onTrigger}.
      */
     private final ThreadLocal<Map<String, String>> triggerFlowAttributes = new ThreadLocal<>();
+
+    @Override
+    protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
+        return S3FlowFileEndpointSupport.withFlowFileEndpoint(super.getSupportedPropertyDescriptors());
+    }
+
+    /**
+     * Skip {@code AbstractAwsProcessor}'s eager S3 client so Endpoint Override Expression Language is not baked in
+     * as empty before the first FlowFile arrives.
+     */
+    @Override
+    public void onScheduled(final ProcessContext context) {
+    }
 
     @Override
     public void onTrigger(final ProcessContext context, final ProcessSession session) throws ProcessException {
@@ -77,6 +93,14 @@ public class PutS3ObjectExtended extends PutS3Object {
     protected S3Client getClient(final ProcessContext context, final Map<String, String> attributes) {
         captureTriggerAttributes(attributes);
         return super.getClient(context, attributes);
+    }
+
+    @Override
+    @SuppressWarnings("rawtypes")
+    protected void configureEndpoint(final ProcessContext context, final SdkClientBuilder clientBuilder,
+                                     final PropertyDescriptor endpointOverrideDescriptor) {
+        final Map<String, String> attributes = triggerFlowAttributes.get() != null ? triggerFlowAttributes.get() : Map.of();
+        S3FlowFileEndpointSupport.apply(context, clientBuilder, attributes, getLogger());
     }
 
     /**

@@ -20,6 +20,7 @@ import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.components.PropertyDescriptor;
+import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
@@ -113,9 +114,18 @@ public class PutS3ObjectExtendedTest {
 
         assertEquals(base.size(), extended.size(), "Extended processor must expose the same set of properties");
         for (int i = 0; i < base.size(); i++) {
-            assertEquals(base.get(i), extended.get(i),
-                    "Property ordering and values must be unchanged: " + base.get(i).getName());
+            assertEquals(base.get(i).getName(), extended.get(i).getName(),
+                    "Property ordering and names must be unchanged: " + base.get(i).getName());
         }
+    }
+
+    @Test
+    public void testEndpointOverrideSupportsFlowFileAttributes() {
+        final PropertyDescriptor endpoint = new PutS3ObjectExtended().getPropertyDescriptors().stream()
+                .filter(pd -> pd.getName().equals(S3FlowFileEndpointSupport.ENDPOINT_OVERRIDE.getName()))
+                .findFirst()
+                .orElseThrow();
+        assertEquals(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES, endpoint.getExpressionLanguageScope());
     }
 
     @Test

@@ -35,8 +35,12 @@ import org.apache.nifi.processors.aws.credentials.provider.factory.strategies.Fi
 import org.apache.nifi.processors.aws.credentials.provider.factory.strategies.ImplicitDefaultCredentialsStrategy;
 import org.apache.nifi.processors.aws.credentials.provider.factory.strategies.NamedProfileCredentialsStrategy;
 import org.apache.nifi.processors.aws.credentials.provider.factory.strategies.WebIdentityCredentialsStrategy;
+import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
 
+import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Proxy;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -136,19 +140,32 @@ public class AWSCredentialsProviderControllerServiceExtended extends AWSCredenti
         return descriptors;
     }
 
+    /**
+     * Returns a provider that evaluates Access Key ID / Secret Access Key at {@code resolveCredentials()} time.
+     * Stock {@code AccessKeyPairCredentialsStrategy} builds {@code AwsBasicCredentials} immediately when
+     * {@code getAwsCredentialsProvider()} is called, which happens in {@code AbstractAwsProcessor.onScheduled}
+     * before any FlowFile exists. Resolving later avoids {@code Access key ID cannot be blank} when the keys
+     * are Expression Language (or FLOWFILE_ATTRIBUTES-scoped literals) and lets per-trigger attributes apply.
+     */
     @Override
     public AwsCredentialsProvider getAwsCredentialsProvider() {
-        final Map<String, String> attributes = EVALUATION_ATTRIBUTES.get();
-        if (attributes == null || attributes.isEmpty()) {
-            return super.getAwsCredentialsProvider();
-        }
+        return new FlowFileAttributeAwareCredentialsProvider();
+    }
 
-        final ConfigurationContext context = configurationContext;
-        if (context == null) {
-            throw new IllegalStateException("AWS Credentials Provider Controller Service is not enabled");
-        }
+    private final class FlowFileAttributeAwareCredentialsProvider implements AwsCredentialsProvider {
+        @Override
+        public AwsCredentials resolveCredentials() {
+            final ConfigurationContext context = configurationContext;
+            if (context == null) {
+                throw new IllegalStateException("AWS Credentials Provider Controller Service is not enabled");
+            }
 
-        return createCredentialsProvider(new FlowFileAttributeEvaluatingConfigurationContext(context, attributes));
+            final Map<String, String> attributes = EVALUATION_ATTRIBUTES.get();
+            final Map<String, String> evaluationAttributes = attributes == null ? Map.of() : attributes;
+            return createCredentialsProvider(
+                    new FlowFileAttributeEvaluatingConfigurationContext(context, evaluationAttributes))
+                    .resolveCredentials();
+        }
     }
 
     private AwsCredentialsProvider createCredentialsProvider(final PropertyContext context) {
@@ -176,6 +193,35 @@ public class AWSCredentialsProviderControllerServiceExtended extends AWSCredenti
     }
 
     /**
+     * Stock AccessKeyPairCredentialsStrategy calls {@code evaluateAttributeExpressions()} with no arguments after
+     * reading the property. Wrap so that extra evaluation cannot replace an already-resolved literal/EL value with
+     * null (FLOWFILE_ATTRIBUTES + no FlowFile).
+     */
+    private static PropertyValue alreadyEvaluated(final PropertyValue evaluated) {
+        final InvocationHandler handler = (proxy, method, args) -> {
+            try {
+                if (method.getName().startsWith("evaluateAttributeExpressions")) {
+                    return proxy;
+                }
+                return method.invoke(evaluated, args);
+            } catch (final InvocationTargetException e) {
+                final Throwable cause = e.getCause() != null ? e.getCause() : e;
+                if (cause instanceof RuntimeException runtimeException) {
+                    throw runtimeException;
+                }
+                if (cause instanceof Error error) {
+                    throw error;
+                }
+                throw new RuntimeException(cause);
+            }
+        };
+        return (PropertyValue) Proxy.newProxyInstance(
+                PropertyValue.class.getClassLoader(),
+                new Class<?>[] {PropertyValue.class},
+                handler);
+    }
+
+    /**
      * Delegating {@link ConfigurationContext} that resolves Expression Language on the overridden access-key properties
      * against published FlowFile attributes. All other calls pass straight through to the real context.
      */
@@ -200,10 +246,13 @@ public class AWSCredentialsProviderControllerServiceExtended extends AWSCredenti
             }
 
             final PropertyValue delegateValue = delegate.getProperty(resolvedDescriptor);
-            if (attributes != null && !attributes.isEmpty()
-                    && FLOWFILE_EL_PROPERTY_NAMES.contains(resolvedDescriptor.getName())
+            if (FLOWFILE_EL_PROPERTY_NAMES.contains(resolvedDescriptor.getName())
                     && resolvedDescriptor.getExpressionLanguageScope() == ExpressionLanguageScope.FLOWFILE_ATTRIBUTES) {
-                return delegateValue.evaluateAttributeExpressions(attributes);
+                final Map<String, String> evaluationAttributes = attributes == null ? Map.of() : attributes;
+                // Always evaluate against a map (empty when no trigger FlowFile). FLOWFILE_ATTRIBUTES
+                // evaluateAttributeExpressions() with no args can return null in a controller service,
+                // which becomes AwsBasicCredentials NPE "Access key ID cannot be blank" even for literals.
+                return alreadyEvaluated(delegateValue.evaluateAttributeExpressions(evaluationAttributes));
             }
             return delegateValue;
         }

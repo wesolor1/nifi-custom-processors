@@ -35,6 +35,7 @@ import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.components.PropertyValue;
 import org.apache.nifi.components.ValidationContext;
 import org.apache.nifi.components.ValidationResult;
+import org.apache.nifi.components.Validator;
 import org.apache.nifi.components.state.Scope;
 import org.apache.nifi.components.state.StateManager;
 import org.apache.nifi.controller.ControllerServiceLookup;
@@ -48,6 +49,7 @@ import org.apache.nifi.processor.ProcessorInitializationContext;
 import org.apache.nifi.processor.Relationship;
 import org.apache.nifi.processor.VerifiableProcessor;
 import org.apache.nifi.processor.exception.ProcessException;
+import org.apache.nifi.processors.aws.AbstractAwsProcessor;
 import org.apache.nifi.processors.aws.credentials.provider.service.AWSCredentialsProviderControllerServiceExtended;
 import org.apache.nifi.processors.aws.s3.AbstractS3Processor;
 import org.apache.nifi.processors.aws.s3.ListS3;
@@ -59,11 +61,16 @@ import org.apache.nifi.serialization.RecordSetWriterFactory;
 import org.apache.nifi.serialization.SimpleRecordSchema;
 import org.apache.nifi.serialization.WriteResult;
 import org.apache.nifi.serialization.record.RecordSchema;
+import software.amazon.awssdk.auth.credentials.AwsCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentialsProvider;
+import software.amazon.awssdk.core.client.builder.SdkClientBuilder;
 import software.amazon.awssdk.services.s3.S3Client;
+import software.amazon.awssdk.services.s3.model.ListObjectVersionsResponse;
+import software.amazon.awssdk.services.s3.model.ListObjectsResponse;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Request;
 import software.amazon.awssdk.services.s3.model.ListObjectsV2Response;
 import software.amazon.awssdk.services.s3.model.RequestPayer;
+import software.amazon.awssdk.services.s3.model.S3Object;
 
 import java.io.IOException;
 import java.io.OutputStream;
@@ -79,6 +86,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Pattern;
 
 /**
  * Extended variant of {@link ListS3} that accepts incoming connections. It is implemented as a sibling
@@ -97,13 +106,16 @@ import java.util.Set;
         + "the object so that it can be fetched in conjunction with FetchS3ObjectExtended. "
         + "This is a drop-in variant of ListS3 that additionally accepts incoming FlowFiles as trigger signals so the listing can be wired "
         + "downstream of another processor. When triggered by a FlowFile, that FlowFile's attributes are used to evaluate Expression Language on "
-        + "the Bucket and Prefix properties and, when using AWSCredentialsProviderControllerServiceExtended, on Access Key ID and Secret Access Key. "
+        + "the Bucket, Prefix and Endpoint Override URL properties and, when using AWSCredentialsProviderControllerServiceExtended, on Access Key ID and Secret Access Key. "
         + "Attributes are copied onto every emitted listing FlowFile (listing attributes take precedence when names "
-        + "overlap). The trigger FlowFile is removed so it is not emitted again with the listing results. When no incoming connection is present, "
+        + "overlap). The trigger FlowFile is removed so it is not emitted again with the listing results. "
+        + "File Filter and Path Filter support Expression Language against trigger FlowFile attributes; blank resolved "
+        + "filter values are ignored. File Filter is a Java regex on the object name (the last segment of the S3 key); "
+        + "Path Filter is a Java regex on the parent path of the key. When no incoming connection is present, "
         + "the processor behaves like the standard ListS3 and lists on its schedule. Before listing, the bucket is checked with a lightweight "
         + "request: if the check fails (e.g. the bucket does not exist or the credentials are invalid), an error FlowFile is routed to the "
-        + "'Failure' relationship; if the bucket contains no objects under the configured prefix, a zero-record FlowFile is routed to the "
-        + "'No Files' relationship (requires Record Writer). "
+        + "'Failure' relationship; if the bucket contains no objects under the configured prefix, or none remain after "
+        + "filters are applied, a zero-record FlowFile is routed to the 'No Files' relationship (requires Record Writer). "
         + "Unlike the standard ListS3, this variant is not primary-node-only, so Execution Node can be 'All Nodes' and incoming connections "
         + "are allowed. When running on a cluster without an incoming connection, set Execution Node to 'Primary Node' to avoid duplicate listings.")
 @WritesAttributes({
@@ -140,7 +152,8 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
 
     public static final Relationship REL_NO_FILES = new Relationship.Builder()
             .name("No Files")
-            .description("A zero-record FlowFile when the bucket has no objects under the configured prefix (requires Record Writer).")
+            .description("A zero-record FlowFile when the listing yields no matching objects after filters are applied "
+                    + "(including an empty bucket/prefix; requires Record Writer).")
             .build();
 
     public static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS, REL_FAILURE, REL_NO_FILES);
@@ -171,13 +184,82 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
             .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
             .build();
 
-    private static final Set<String> FLOWFILE_EL_PROPERTY_NAMES = Set.of(BUCKET.getName(), PREFIX.getName());
+    /**
+     * Endpoint Override URL driven by trigger FlowFile attributes (e.g. {@code ${source_endpoint_override}} for HPC).
+     * The stock descriptor only supports ENVIRONMENT-scope Expression Language and is baked into the S3 client at
+     * {@code onScheduled}, so an attribute expression would be empty and the client would talk to AWS.
+     */
+    public static final PropertyDescriptor ENDPOINT_OVERRIDE = S3FlowFileEndpointSupport.ENDPOINT_OVERRIDE;
+
+    /**
+     * Regex validator that is aware of Expression Language: when the configured value contains EL (e.g.
+     * {@code ${file_filter}}) the actual pattern is only known at runtime against FlowFile attributes, so the literal
+     * is not compiled here. A blank value is treated as "no filter" since these properties are optional.
+     */
+    static final Validator EL_AWARE_REGULAR_EXPRESSION_VALIDATOR = (subject, input, context) -> {
+        if (context.isExpressionLanguageSupported(subject) && context.isExpressionLanguagePresent(input)) {
+            return new ValidationResult.Builder()
+                    .subject(subject)
+                    .input(input)
+                    .valid(true)
+                    .explanation("Expression Language present; pattern is evaluated at runtime.")
+                    .build();
+        }
+        if (input == null || input.isBlank()) {
+            return new ValidationResult.Builder()
+                    .subject(subject)
+                    .input(input)
+                    .valid(true)
+                    .explanation("Empty value; no filter will be applied.")
+                    .build();
+        }
+        try {
+            Pattern.compile(input);
+            return new ValidationResult.Builder().subject(subject).input(input).valid(true).build();
+        } catch (final Exception e) {
+            return new ValidationResult.Builder()
+                    .subject(subject)
+                    .input(input)
+                    .valid(false)
+                    .explanation("Not a valid Java Regular Expression: " + e.getMessage())
+                    .build();
+        }
+    };
+
+    public static final PropertyDescriptor FILE_FILTER = new PropertyDescriptor.Builder()
+            .name("File Filter")
+            .description("Only objects whose names (the last segment of the S3 key) match the given regular expression "
+                    + "will be listed. Supports Expression Language against FlowFile attributes; if the resolved value "
+                    + "is empty, no file name filter is applied.")
+            .required(false)
+            .addValidator(EL_AWARE_REGULAR_EXPRESSION_VALIDATOR)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .build();
+
+    public static final PropertyDescriptor PATH_FILTER = new PropertyDescriptor.Builder()
+            .name("Path Filter")
+            .description("Only objects whose parent path (the S3 key up to, but not including, the file name) match "
+                    + "the given regular expression will be listed. Supports Expression Language against FlowFile "
+                    + "attributes; if the resolved value is empty, no path filter is applied.")
+            .required(false)
+            .addValidator(EL_AWARE_REGULAR_EXPRESSION_VALIDATOR)
+            .expressionLanguageSupported(ExpressionLanguageScope.FLOWFILE_ATTRIBUTES)
+            .build();
+
+    private static final Set<String> FLOWFILE_EL_PROPERTY_NAMES =
+            Set.of(BUCKET.getName(), PREFIX.getName(), ENDPOINT_OVERRIDE.getName());
 
     /**
      * Snapshot of the last trigger FlowFile's attributes, used both for Expression Language during the listing and
      * for copying onto every emitted FlowFile. Always cleared in a {@code finally} block.
      */
     private final ThreadLocal<Map<String, String>> triggerFlowAttributes = new ThreadLocal<>();
+
+    /**
+     * Compiled File Filter / Path Filter for the current trigger. Set around listing so both the S3 client wrapper
+     * (stock ListS3) and the session wrapper (test doubles / attribute listing) see the same patterns.
+     */
+    private final ThreadLocal<ListingFilters> listingFilters = new ThreadLocal<>();
 
     /**
      * Stock listing implementation. Lives as a sibling instance rather than a superclass so this processor is not
@@ -198,6 +280,10 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
                 descriptors.add(BUCKET);
             } else if (descriptor.getName().equals(PREFIX.getName())) {
                 descriptors.add(PREFIX);
+                descriptors.add(FILE_FILTER);
+                descriptors.add(PATH_FILTER);
+            } else if (descriptor.getName().equals(ENDPOINT_OVERRIDE.getName())) {
+                descriptors.add(ENDPOINT_OVERRIDE);
             } else {
                 descriptors.add(descriptor);
             }
@@ -208,6 +294,14 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
     @Override
     protected void init(final ProcessorInitializationContext context) {
         listingEngine.initialize(context);
+    }
+
+    /**
+     * Skip {@link AbstractAwsProcessor}'s eager S3 client. Endpoint Override and credentials may be FlowFile
+     * Expression Language and are only known when a trigger FlowFile arrives.
+     */
+    @Override
+    public void onScheduled(final ProcessContext context) {
     }
 
     @OnScheduled
@@ -272,11 +366,21 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
         }
 
         triggerFlowAttributes.set(triggerAttributes);
+        if (triggerAttributes != null && !triggerAttributes.isEmpty()) {
+            AWSCredentialsProviderControllerServiceExtended.setEvaluationAttributes(triggerAttributes);
+        }
         try {
+            final Map<String, String> elAttributes = triggerAttributes != null ? triggerAttributes : Map.of();
+            listingFilters.set(new ListingFilters(
+                    compileFilterOrNull(context.getProperty(FILE_FILTER), elAttributes),
+                    compileFilterOrNull(context.getProperty(PATH_FILTER), elAttributes)));
+
             final ProcessContext listingContext = triggerAttributes == null
                     ? context
                     : new FlowFileAwareProcessContext(context, triggerFlowAttributes);
-            final ProcessSession listingSession = withTriggerAttributes(session, triggerAttributes);
+            final AtomicInteger listedCount = new AtomicInteger();
+            final ProcessSession listingSession = withListingFilters(
+                    withTriggerAttributes(session, triggerAttributes), listedCount);
             try {
                 // The stock ListS3 swallows listing errors internally (logs + rollback + yield), so failures are
                 // detected with a lightweight preflight request instead. The same request detects an empty bucket.
@@ -285,12 +389,17 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
                     return;
                 }
                 performListing(listingContext, listingSession);
+                if (listedCount.get() == 0) {
+                    emitEmptyFlowFileIfNeeded(context, listingSession);
+                }
             } catch (final Exception e) {
                 getLogger().error("Failed to perform S3 listing or handle FlowFiles due to: {}", e.getMessage(), e);
                 transferErrorFlowFile(listingSession, context, e);
             }
         } finally {
             triggerFlowAttributes.remove();
+            listingFilters.remove();
+            AWSCredentialsProviderControllerServiceExtended.clearEvaluationAttributes();
         }
     }
 
@@ -303,16 +412,57 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
         listingEngine.onTrigger(context, session);
     }
 
+    /**
+     * Returns a provider that re-resolves credentials on every SDK call. AbstractAwsProcessor caches S3 clients by
+     * region and creates one eagerly in {@code onScheduled}, before any trigger FlowFile exists. Resolving inside
+     * {@code resolveCredentials()} keeps initialize from failing when Access Key ID / Secret Access Key are
+     * Expression Language, and still picks up per-trigger attributes on the listing request.
+     */
     @Override
     protected AwsCredentialsProvider getCredentialsProvider(final ProcessContext context) {
-        final Map<String, String> attributes = triggerFlowAttributes.get();
+        return new FlowFileAwareCredentialsProvider(context);
+    }
+
+    @Override
+    protected S3Client getClient(final ProcessContext context) {
+        final Map<String, String> attributes = triggerFlowAttributes.get() != null ? triggerFlowAttributes.get() : Map.of();
+        return getClient(context, attributes);
+    }
+
+    @Override
+    protected S3Client getClient(final ProcessContext context, final Map<String, String> attributes) {
         if (attributes != null && !attributes.isEmpty()) {
-            AWSCredentialsProviderControllerServiceExtended.setEvaluationAttributes(attributes);
+            triggerFlowAttributes.set(attributes);
         }
-        try {
-            return super.getCredentialsProvider(context);
-        } finally {
-            AWSCredentialsProviderControllerServiceExtended.clearEvaluationAttributes();
+        return super.getClient(context, attributes);
+    }
+
+    @Override
+    @SuppressWarnings("rawtypes")
+    protected void configureEndpoint(final ProcessContext context, final SdkClientBuilder clientBuilder,
+                                     final PropertyDescriptor endpointOverrideDescriptor) {
+        final Map<String, String> attributes = triggerFlowAttributes.get() != null ? triggerFlowAttributes.get() : Map.of();
+        S3FlowFileEndpointSupport.apply(context, clientBuilder, attributes, getLogger());
+    }
+
+    private final class FlowFileAwareCredentialsProvider implements AwsCredentialsProvider {
+        private final ProcessContext context;
+
+        private FlowFileAwareCredentialsProvider(final ProcessContext context) {
+            this.context = context;
+        }
+
+        @Override
+        public AwsCredentials resolveCredentials() {
+            final Map<String, String> attributes = triggerFlowAttributes.get();
+            if (attributes != null && !attributes.isEmpty()) {
+                AWSCredentialsProviderControllerServiceExtended.setEvaluationAttributes(attributes);
+            }
+            try {
+                return ListS3Extended.super.getCredentialsProvider(context).resolveCredentials();
+            } finally {
+                AWSCredentialsProviderControllerServiceExtended.clearEvaluationAttributes();
+            }
         }
     }
 
@@ -440,6 +590,152 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
                 handler);
     }
 
+    /**
+     * Drops listing FlowFiles whose S3 key does not match File Filter / Path Filter, and counts those transferred
+     * to success so an empty-after-filter listing can be routed to No Files.
+     */
+    private ProcessSession withListingFilters(final ProcessSession session, final AtomicInteger listedCount) {
+        final InvocationHandler handler = (proxy, method, args) -> {
+            if ("transfer".equals(method.getName()) && args != null && args.length == 2
+                    && args[1] instanceof Relationship relationship
+                    && "success".equals(relationship.getName())) {
+                if (args[0] instanceof FlowFile flowFile) {
+                    if (shouldDropListedFlowFile(flowFile)) {
+                        session.remove(flowFile);
+                        return null;
+                    }
+                    listedCount.incrementAndGet();
+                }
+            }
+            return method.invoke(session, args);
+        };
+
+        return (ProcessSession) Proxy.newProxyInstance(
+                ProcessSession.class.getClassLoader(),
+                new Class<?>[] {ProcessSession.class},
+                handler);
+    }
+
+    private boolean shouldDropListedFlowFile(final FlowFile flowFile) {
+        final ListingFilters filters = listingFilters.get();
+        if (filters == null || !filters.isActive()) {
+            return false;
+        }
+        final String key = flowFile.getAttribute("filename");
+        // Record-writer listings do not set filename on the aggregate FlowFile; leave those alone.
+        if (key == null) {
+            return false;
+        }
+        return !matchesFilters(key, filters.filePattern(), filters.pathPattern());
+    }
+
+    /**
+     * Filters S3 list responses so stock ListS3 never tracks or emits objects that fail File/Path Filter.
+     */
+    private S3Client withListingFilters(final S3Client client) {
+        final ListingFilters filters = listingFilters.get();
+        if (client == null || filters == null || !filters.isActive()) {
+            return client;
+        }
+
+        final InvocationHandler handler = (proxy, method, args) -> {
+            try {
+                final Object result = method.invoke(client, args);
+                return filters.applyToListResponse(result);
+            } catch (final InvocationTargetException e) {
+                final Throwable cause = e.getCause() != null ? e.getCause() : e;
+                if (cause instanceof RuntimeException runtimeException) {
+                    throw runtimeException;
+                }
+                if (cause instanceof Error error) {
+                    throw error;
+                }
+                throw new ProcessException("S3 listing failed", cause);
+            }
+        };
+
+        return (S3Client) Proxy.newProxyInstance(
+                S3Client.class.getClassLoader(),
+                new Class<?>[] {S3Client.class},
+                handler);
+    }
+
+    /**
+     * Resolves a regex filter property against the supplied FlowFile attributes and compiles it. Returns {@code null}
+     * (meaning "no filter") when the property is unset or its resolved value is empty/blank, e.g. when an
+     * Expression Language reference such as {@code ${file_filter}} resolves to an empty or missing attribute.
+     */
+    static Pattern compileFilterOrNull(final PropertyValue property, final Map<String, String> elAttributes) {
+        if (!property.isSet()) {
+            return null;
+        }
+        final String value = property.evaluateAttributeExpressions(elAttributes).getValue();
+        if (value == null || value.isBlank()) {
+            return null;
+        }
+        return Pattern.compile(value);
+    }
+
+    static String filenameOfKey(final String key) {
+        if (key == null || key.isEmpty()) {
+            return "";
+        }
+        final int slash = key.lastIndexOf('/');
+        return slash < 0 ? key : key.substring(slash + 1);
+    }
+
+    static String pathOfKey(final String key) {
+        if (key == null || key.isEmpty()) {
+            return "";
+        }
+        final int slash = key.lastIndexOf('/');
+        return slash < 0 ? "" : key.substring(0, slash);
+    }
+
+    static boolean matchesFilters(final String key, final Pattern filePattern, final Pattern pathPattern) {
+        if (filePattern != null && !filePattern.matcher(filenameOfKey(key)).matches()) {
+            return false;
+        }
+        if (pathPattern != null && !pathPattern.matcher(pathOfKey(key)).matches()) {
+            return false;
+        }
+        return true;
+    }
+
+    private record ListingFilters(Pattern filePattern, Pattern pathPattern) {
+        boolean isActive() {
+            return filePattern != null || pathPattern != null;
+        }
+
+        Object applyToListResponse(final Object result) {
+            if (result instanceof ListObjectsV2Response response) {
+                final List<S3Object> filtered = response.contents().stream()
+                        .filter(object -> matchesFilters(object.key(), filePattern, pathPattern))
+                        .toList();
+                return response.toBuilder()
+                        .contents(filtered)
+                        .keyCount(filtered.size())
+                        .build();
+            }
+            if (result instanceof ListObjectsResponse response) {
+                final List<S3Object> filtered = response.contents().stream()
+                        .filter(object -> matchesFilters(object.key(), filePattern, pathPattern))
+                        .toList();
+                return response.toBuilder()
+                        .contents(filtered)
+                        .build();
+            }
+            if (result instanceof ListObjectVersionsResponse response) {
+                return response.toBuilder()
+                        .versions(response.versions().stream()
+                                .filter(version -> matchesFilters(version.key(), filePattern, pathPattern))
+                                .toList())
+                        .build();
+            }
+            return result;
+        }
+    }
+
     private void invokeListS3Lifecycle(final Class<? extends Annotation> annotationType, final Object... availableArgs) {
         invokeLifecycleMethods(ListS3.class.getDeclaredMethods(), annotationType, availableArgs);
     }
@@ -509,11 +805,26 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
         Collection<ValidationResult> exposeCustomValidate(final ValidationContext validationContext) {
             return super.customValidate(validationContext);
         }
+
+        @Override
+        protected AwsCredentialsProvider getCredentialsProvider(final ProcessContext context) {
+            return ListS3Extended.this.getCredentialsProvider(context);
+        }
+
+        @Override
+        protected S3Client getClient(final ProcessContext context) {
+            return withListingFilters(ListS3Extended.this.getClient(context));
+        }
+
+        @Override
+        protected S3Client getClient(final ProcessContext context, final Map<String, String> attributes) {
+            return withListingFilters(ListS3Extended.this.getClient(context, attributes));
+        }
     }
 
     /**
-     * Delegating {@link ProcessContext} that resolves Expression Language on the overridden Bucket and Prefix
-     * properties against the trigger FlowFile's attributes. All other calls pass straight through to the real context.
+     * Delegating {@link ProcessContext} that resolves Expression Language on Bucket, Prefix and Endpoint Override
+     * against the trigger FlowFile's attributes. All other calls pass straight through to the real context.
      */
     private static final class FlowFileAwareProcessContext implements ProcessContext {
         private final ProcessContext delegate;
@@ -531,6 +842,8 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
                 resolvedDescriptor = BUCKET;
             } else if (PREFIX.getName().equals(descriptor.getName())) {
                 resolvedDescriptor = PREFIX;
+            } else if (ENDPOINT_OVERRIDE.getName().equals(descriptor.getName())) {
+                resolvedDescriptor = ENDPOINT_OVERRIDE;
             } else {
                 resolvedDescriptor = descriptor;
             }
