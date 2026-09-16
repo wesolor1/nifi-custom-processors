@@ -111,7 +111,9 @@ import java.util.regex.Pattern;
         + "overlap). The trigger FlowFile is removed so it is not emitted again with the listing results. "
         + "File Filter and Path Filter support Expression Language against trigger FlowFile attributes; blank resolved "
         + "filter values are ignored. File Filter is a Java regex on the object name (the last segment of the S3 key); "
-        + "Path Filter is a Java regex on the parent path of the key. When no incoming connection is present, "
+        + "Path Filter is a Java regex on the parent path of the key. S3 folder placeholders (keys ending with '/') "
+        + "are skipped, matching ListSFTPExtended / ListAzureDataLakeStorageExtended which omit directories. "
+        + "When no incoming connection is present, "
         + "the processor behaves like the standard ListS3 and lists on its schedule. Before listing, the bucket is checked with a lightweight "
         + "request: if the check fails (e.g. the bucket does not exist or the credentials are invalid), an error FlowFile is routed to the "
         + "'Failure' relationship; if the bucket contains no objects under the configured prefix, or none remain after "
@@ -152,8 +154,8 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
 
     public static final Relationship REL_NO_FILES = new Relationship.Builder()
             .name("No Files")
-            .description("A zero-record FlowFile when the listing yields no matching objects after filters are applied "
-                    + "(including an empty bucket/prefix; requires Record Writer).")
+            .description("A zero-record FlowFile when the listing yields no matching files after folder placeholders "
+                    + "and File/Path filters are applied (including an empty bucket/prefix; requires Record Writer).")
             .build();
 
     public static final Set<Relationship> RELATIONSHIPS = Set.of(REL_SUCCESS, REL_FAILURE, REL_NO_FILES);
@@ -591,8 +593,8 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
     }
 
     /**
-     * Drops listing FlowFiles whose S3 key does not match File Filter / Path Filter, and counts those transferred
-     * to success so an empty-after-filter listing can be routed to No Files.
+     * Drops listing FlowFiles for S3 folder placeholders and keys that fail File/Path Filter, and counts those
+     * transferred to success so an empty-after-filter listing can be routed to No Files.
      */
     private ProcessSession withListingFilters(final ProcessSession session, final AtomicInteger listedCount) {
         final InvocationHandler handler = (proxy, method, args) -> {
@@ -617,24 +619,29 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
     }
 
     private boolean shouldDropListedFlowFile(final FlowFile flowFile) {
-        final ListingFilters filters = listingFilters.get();
-        if (filters == null || !filters.isActive()) {
+        // Record Writer emits one aggregate FlowFile. NiFi always copies the trigger's filename (a UUID)
+        // onto it; that is not an S3 key. Object filters already ran on the S3 list response before
+        // records were written — never treat this FlowFile as a listed object.
+        if (flowFile.getAttribute("record.count") != null) {
             return false;
         }
         final String key = flowFile.getAttribute("filename");
-        // Record-writer listings do not set filename on the aggregate FlowFile; leave those alone.
         if (key == null) {
             return false;
         }
-        return !matchesFilters(key, filters.filePattern(), filters.pathPattern());
+        final ListingFilters filters = listingFilters.get();
+        final Pattern filePattern = filters == null ? null : filters.filePattern();
+        final Pattern pathPattern = filters == null ? null : filters.pathPattern();
+        return !matchesFilters(key, filePattern, pathPattern);
     }
 
     /**
-     * Filters S3 list responses so stock ListS3 never tracks or emits objects that fail File/Path Filter.
+     * Filters S3 list responses so stock ListS3 never tracks or emits folder placeholders or objects that fail
+     * File/Path Filter.
      */
     private S3Client withListingFilters(final S3Client client) {
         final ListingFilters filters = listingFilters.get();
-        if (client == null || filters == null || !filters.isActive()) {
+        if (client == null || filters == null) {
             return client;
         }
 
@@ -692,7 +699,18 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
         return slash < 0 ? "" : key.substring(0, slash);
     }
 
+    /**
+     * S3 has no real directories. Consoles still show folders as zero-byte objects whose key ends with {@code /}
+     * (including the listed prefix itself). Those are not files and must not be emitted.
+     */
+    static boolean isDirectoryKey(final String key) {
+        return key == null || key.endsWith("/") || filenameOfKey(key).isEmpty();
+    }
+
     static boolean matchesFilters(final String key, final Pattern filePattern, final Pattern pathPattern) {
+        if (isDirectoryKey(key)) {
+            return false;
+        }
         if (filePattern != null && !filePattern.matcher(filenameOfKey(key)).matches()) {
             return false;
         }
@@ -703,9 +721,6 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
     }
 
     private record ListingFilters(Pattern filePattern, Pattern pathPattern) {
-        boolean isActive() {
-            return filePattern != null || pathPattern != null;
-        }
 
         Object applyToListResponse(final Object result) {
             if (result instanceof ListObjectsV2Response response) {

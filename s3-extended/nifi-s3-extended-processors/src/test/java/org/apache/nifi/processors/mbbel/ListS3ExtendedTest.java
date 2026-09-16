@@ -81,6 +81,7 @@ public class ListS3ExtendedTest {
         volatile boolean bucketHasObjects = true;
         volatile RuntimeException preflightException;
         volatile List<String> listedKeys = List.of("object-key.txt");
+        volatile boolean emitRecordListing = false;
 
         @Override
         public void onScheduled(final ProcessContext context) {
@@ -104,6 +105,17 @@ public class ListS3ExtendedTest {
             resolvedEndpoint = context.getProperty(ListS3Extended.ENDPOINT_OVERRIDE).getValue();
 
             if (!emitFlowFile) {
+                return;
+            }
+
+            if (emitRecordListing) {
+                FlowFile listed = session.create();
+                final Map<String, String> attributes = new HashMap<>();
+                attributes.put("record.count", String.valueOf(listedKeys.size()));
+                attributes.put("s3.bucket", resolvedBucket);
+                attributes.put("mime.type", "application/json");
+                listed = session.putAllAttributes(listed, attributes);
+                session.transfer(listed, REL_SUCCESS);
                 return;
             }
 
@@ -531,5 +543,87 @@ public class ListS3ExtendedTest {
                 "NIFIDEV/DATA/other/file.xml", xmlName, discountPath));
         assertTrue(ListS3Extended.matchesFilters(
                 "NIFIDEV/DATA/GOODWILL/Output/discount/file.xml", xmlName, null));
+        assertTrue(ListS3Extended.isDirectoryKey(
+                "NIFIDEV/DATA/GOODWILL/Output/discount/"));
+        assertTrue(ListS3Extended.isDirectoryKey(
+                "NIFIDEV/DATA/GOODWILL/Output/discount/shouldnotbeprocessed/"));
+        assertFalse(ListS3Extended.matchesFilters(
+                "NIFIDEV/DATA/GOODWILL/Output/discount/shouldnotbeprocessed/", null, null));
+        assertFalse(ListS3Extended.matchesFilters(
+                "NIFIDEV/DATA/GOODWILL/Output/discount/", Pattern.compile(".*"), null));
+    }
+
+    @Test
+    public void testS3FolderPlaceholderIsNotListedToSuccess() throws InitializationException {
+        final TestableListS3Extended processor = new TestableListS3Extended();
+        processor.listedKeys = List.of(
+                "NIFIDEV/DATA/GOODWILL/Output/discount/",
+                "NIFIDEV/DATA/GOODWILL/Output/discount/shouldnotbeprocessed/");
+        final TestRunner runner = newRunner(processor);
+        runner.setProperty(ListS3Extended.BUCKET, "my-bucket");
+
+        final MockRecordWriter writerFactory = new MockRecordWriter(null, false);
+        runner.addControllerService("record-writer", writerFactory);
+        runner.enableControllerService(writerFactory);
+        runner.setProperty(ListS3.RECORD_WRITER, "record-writer");
+
+        runner.enqueue("trigger".getBytes(), Map.of("batch.id", "B-folders-only"));
+        runner.run();
+
+        runner.assertTransferCount(ListS3Extended.REL_SUCCESS, 0);
+        runner.assertTransferCount(ListS3Extended.REL_FAILURE, 0);
+        runner.assertTransferCount(ListS3Extended.REL_NO_FILES, 1);
+        runner.getFlowFilesForRelationship(ListS3Extended.REL_NO_FILES).get(0)
+                .assertAttributeEquals("batch.id", "B-folders-only");
+    }
+
+    @Test
+    public void testS3FolderPlaceholderIsSkippedWhenRealFilesExist() throws InitializationException {
+        final TestableListS3Extended processor = new TestableListS3Extended();
+        processor.listedKeys = List.of(
+                "NIFIDEV/DATA/GOODWILL/Output/discount/",
+                "NIFIDEV/DATA/GOODWILL/Output/discount/shouldnotbeprocessed/",
+                "NIFIDEV/DATA/GOODWILL/Output/discount/file.xml");
+        final TestRunner runner = newRunner(processor);
+        runner.setProperty(ListS3Extended.BUCKET, "my-bucket");
+
+        runner.enqueue("trigger".getBytes());
+        runner.run();
+
+        runner.assertTransferCount(ListS3Extended.REL_SUCCESS, 1);
+        runner.assertTransferCount(ListS3Extended.REL_NO_FILES, 0);
+        runner.getFlowFilesForRelationship(ListS3Extended.REL_SUCCESS).get(0)
+                .assertAttributeEquals("filename", "NIFIDEV/DATA/GOODWILL/Output/discount/file.xml");
+    }
+
+    @Test
+    public void testRecordWriterListingIsNotDroppedWhenTriggerFilenameDoesNotMatchFileFilter()
+            throws InitializationException {
+        final TestableListS3Extended processor = new TestableListS3Extended();
+        processor.emitRecordListing = true;
+        processor.listedKeys = List.of(
+                "NIFIDEV/DATA/GOODWILL/Output/discount/test3_20260827170911659.xml",
+                "NIFIDEV/DATA/GOODWILL/Output/discount/testwim001_202608271703815.xml");
+        final TestRunner runner = newRunner(processor);
+        runner.setProperty(ListS3Extended.BUCKET, "my-bucket");
+        runner.setProperty(ListS3Extended.FILE_FILTER, "${file_filter}");
+
+        final MockRecordWriter writerFactory = new MockRecordWriter(null, false);
+        runner.addControllerService("record-writer", writerFactory);
+        runner.enableControllerService(writerFactory);
+        runner.setProperty(ListS3.RECORD_WRITER, "record-writer");
+
+        final Map<String, String> triggerAttributes = new HashMap<>();
+        triggerAttributes.put("filename", "occurrence-uuid-not-an-xml");
+        triggerAttributes.put("file_filter", "(?i)^.*\\.xml$");
+        triggerAttributes.put("batch.id", "B-records");
+        runner.enqueue("trigger".getBytes(), triggerAttributes);
+        runner.run();
+
+        runner.assertTransferCount(ListS3Extended.REL_SUCCESS, 1);
+        runner.assertTransferCount(ListS3Extended.REL_NO_FILES, 0);
+        final MockFlowFile out = runner.getFlowFilesForRelationship(ListS3Extended.REL_SUCCESS).get(0);
+        out.assertAttributeEquals("record.count", "2");
+        out.assertAttributeEquals("batch.id", "B-records");
     }
 }
