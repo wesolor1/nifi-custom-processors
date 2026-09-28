@@ -1,3 +1,6 @@
+# Collected NARs for a NiFi upgrade (see scripts/Prepare-NifiUpgrade.ps1)
+dist/
+
 # Maven build output (compiled classes, packaged artifacts, mvn install/package files)
 target/
 **/target/

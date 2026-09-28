@@ -22,6 +22,7 @@ import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.controller.AbstractControllerService;
 import org.apache.nifi.processor.ProcessContext;
+import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.util.file.transfer.FileInfo;
 import org.apache.nifi.processor.util.file.transfer.ListFileTransfer;
 import org.apache.nifi.processor.util.list.AbstractListProcessor;
@@ -76,6 +77,36 @@ public class ListSFTPExtendedTest {
         }
     }
 
+    /**
+     * Remote directory looks empty because a subdirectory could not be read. {@code SFTPTransfer} logs those
+     * failures through the listing logger and keeps going, so the listing itself does not throw.
+     */
+    private static class IncompleteListingSftp extends ListSFTPExtended {
+        @Override
+        protected List<FileInfo> performListing(final ProcessContext context, final Long minTimestamp, final ListingMode listingMode,
+                                                final boolean applyFilters) {
+            getListingLogger().error("Unable to get listing from {}; skipping", "/MBD001/FromDealer",
+                    new IOException("Read timeout"));
+            return Collections.emptyList();
+        }
+    }
+
+    /**
+     * Listing succeeds but no FlowFile is produced, which is what the parent {@code AbstractListProcessor} does when
+     * the Record Writer or the state update fails: it logs and yields.
+     */
+    private static class SilentlyYieldingSftp extends SingleFileListingSftp {
+        @Override
+        public void listByNoTracking(final ProcessContext context, final ProcessSession session) {
+            try {
+                performListing(context, 0L, ListingMode.EXECUTION);
+            } catch (final IOException e) {
+                throw new AssertionError(e);
+            }
+            context.yield();
+        }
+    }
+
     private static class ExceptionListingSftp extends ListSFTPExtended {
         @Override
         @SuppressWarnings("unchecked")
@@ -121,7 +152,7 @@ public class ListSFTPExtendedTest {
          * {@code context.getProperty(HOSTNAME).evaluateAttributeExpressions()} (no args).
          * NiFi's {@code MockPropertyValue} (unlike real NiFi) rejects no-args evaluation on
          * FLOWFILE_ATTRIBUTES-scoped properties, so we just return a minimal listing attribute map.
-         * The trigger-attribute merge still happens via the {@code withTriggerAttributes} proxy.
+         * The trigger-attribute merge still happens via the listing session proxy.
          */
         @Override
         protected Map<String, String> createAttributes(final FileInfo fileInfo, final ProcessContext context) {
@@ -151,13 +182,20 @@ public class ListSFTPExtendedTest {
         @Override
         public RecordSetWriter createWriter(ComponentLog logger, RecordSchema schema, OutputStream out, Map<String, String> variables) {
             return new RecordSetWriter() {
+                private int recordCount;
+
                 @Override
                 public WriteResult write(org.apache.nifi.serialization.record.Record record) throws IOException {
-                    throw new UnsupportedOperationException();
+                    recordCount++;
+                    return WriteResult.of(recordCount, Collections.emptyMap());
                 }
 
                 @Override
                 public WriteResult write(org.apache.nifi.serialization.record.RecordSet recordSet) throws IOException {
+                    org.apache.nifi.serialization.record.Record record;
+                    while ((record = recordSet.next()) != null) {
+                        write(record);
+                    }
                     return finishRecordSet();
                 }
 
@@ -167,7 +205,7 @@ public class ListSFTPExtendedTest {
 
                 @Override
                 public WriteResult finishRecordSet() throws IOException {
-                    return WriteResult.of(0, Collections.emptyMap());
+                    return WriteResult.of(recordCount, Collections.emptyMap());
                 }
 
                 @Override
@@ -393,7 +431,7 @@ public class ListSFTPExtendedTest {
     }
 
     @Test
-    public void testTriggerFlowFileIsRemovedFromSession() throws Exception {
+    public void testTriggerFlowFileIsRemovedAndAnsweredWithoutRecordWriter() throws Exception {
         final TestRunner runner = newRunner(new EmptyListingSftp());
 
         runner.enqueue("trigger", Map.of("batch.id", "B3"));
@@ -401,8 +439,74 @@ public class ListSFTPExtendedTest {
 
         runner.assertQueueEmpty();
         runner.assertTransferCount(ListSFTPExtended.REL_SUCCESS, 0);
-        runner.assertTransferCount(ListSFTPExtended.REL_NO_FILES, 0);
         runner.assertTransferCount(ListSFTPExtended.REL_FAILURE, 0);
+        runner.assertTransferCount(ListSFTPExtended.REL_NO_FILES, 1);
+
+        final MockFlowFile emitted = runner.getFlowFilesForRelationship(ListSFTPExtended.REL_NO_FILES).get(0);
+        emitted.assertAttributeEquals("batch.id", "B3");
+        emitted.assertAttributeEquals("record.count", "0");
+    }
+
+    @Test
+    public void testUnreadableDirectoryRoutesToFailureInsteadOfNoFiles() throws Exception {
+        final TestRunner runner = newRunner(new IncompleteListingSftp());
+        registerWriter(runner);
+
+        runner.enqueue("trigger", Map.of("batch.id", "B-incomplete"));
+        runner.run(1);
+
+        runner.assertTransferCount(ListSFTPExtended.REL_FAILURE, 1);
+        runner.assertTransferCount(ListSFTPExtended.REL_NO_FILES, 0);
+        runner.assertTransferCount(ListSFTPExtended.REL_SUCCESS, 0);
+
+        final MockFlowFile failure = runner.getFlowFilesForRelationship(ListSFTPExtended.REL_FAILURE).get(0);
+        failure.assertAttributeEquals("batch.id", "B-incomplete");
+        failure.assertAttributeEquals(ListSFTPExtended.INCOMPLETE_DIRECTORIES_ATTRIBUTE, "1");
+        assertTrue(failure.getAttribute("error.message").contains("Listing was incomplete"),
+                "error.message should explain the incomplete listing, was: " + failure.getAttribute("error.message"));
+        assertTrue(failure.getAttribute("error.message").contains("/MBD001/FromDealer"),
+                "error.message should name the directory that could not be read");
+    }
+
+    @Test
+    public void testListedFilesWithoutFlowFileRouteToFailure() throws Exception {
+        final TestRunner runner = newRunner(new SilentlyYieldingSftp());
+        registerWriter(runner);
+
+        runner.enqueue("trigger", Map.of("batch.id", "B-nowrite"));
+        runner.run(1);
+
+        runner.assertTransferCount(ListSFTPExtended.REL_FAILURE, 1);
+        runner.assertTransferCount(ListSFTPExtended.REL_NO_FILES, 0);
+        runner.assertTransferCount(ListSFTPExtended.REL_SUCCESS, 0);
+
+        final MockFlowFile failure = runner.getFlowFilesForRelationship(ListSFTPExtended.REL_FAILURE).get(0);
+        failure.assertAttributeEquals("batch.id", "B-nowrite");
+        assertTrue(failure.getAttribute("error.message").contains("Listing matched 1 file(s)"),
+                "error.message should report the listed file count, was: " + failure.getAttribute("error.message"));
+    }
+
+    @Test
+    public void testEveryTriggerProducesExactlyOneOutcome() throws Exception {
+        final List<ListSFTPExtended> processors = List.of(
+                new EmptyListingSftp(), new FilterExcludedListingSftp(), new SingleFileListingSftp(),
+                new IncompleteListingSftp(), new SilentlyYieldingSftp(), new ExceptionListingSftp());
+
+        for (final ListSFTPExtended processor : processors) {
+            final TestRunner runner = newRunner(processor);
+            registerWriter(runner);
+
+            runner.enqueue("trigger", Map.of("batch.id", "B-" + processor.getClass().getSimpleName()));
+            runner.run(1);
+
+            final int emitted = runner.getFlowFilesForRelationship(ListSFTPExtended.REL_SUCCESS).size()
+                    + runner.getFlowFilesForRelationship(ListSFTPExtended.REL_NO_FILES).size()
+                    + runner.getFlowFilesForRelationship(ListSFTPExtended.REL_FAILURE).size();
+
+            assertEquals(1, emitted, processor.getClass().getSimpleName()
+                    + " must answer the trigger with exactly one FlowFile");
+            runner.assertQueueEmpty();
+        }
     }
 
 }

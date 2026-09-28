@@ -22,6 +22,7 @@ import org.apache.nifi.scheduling.ExecutionNode;
 import org.apache.nifi.context.PropertyContext;
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.flowfile.FlowFile;
+import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.migration.PropertyConfiguration;
 import org.apache.nifi.processor.DataUnit;
 import org.apache.nifi.processor.ProcessContext;
@@ -48,10 +49,12 @@ import org.apache.nifi.schema.access.SchemaNotFoundException;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -64,12 +67,15 @@ import java.util.stream.Collectors;
         + "This processor can optionally accept incoming FlowFiles as trigger signals. Trigger attributes are used for "
         + "Expression Language and are copied onto each emitted listing FlowFile; listing attributes take precedence when names overlap. "
         + "The trigger FlowFile is removed so it is not emitted again with listing results. "
-        + "When a Record Writer is configured, a zero-record FlowFile is routed to No Files only when the remote directory has no file entries. "
+        + "Every trigger produces exactly one outcome: listing FlowFiles on success, an empty FlowFile on No Files when nothing matched, "
+        + "or an error FlowFile on Failure. A trigger is never consumed without a reply, so a scheduled batch cannot be left unanswered. "
         + "Password is non-sensitive and supports dynamic authentication: when the resolved Password, Private Key Path, or Private Key Passphrase "
         + "is blank it is treated as unset so the other credential can be used. File Filter Regex and Path Filter Regex support Expression Language "
         + "against trigger FlowFile attributes; blank resolved filter values are ignored. "
         + "When the remote listing fails (connection error, path not found, etc.), an error FlowFile "
-        + "is routed to Failure with error.message / error.class and SFTP connection attributes.")
+        + "is routed to Failure with error.message / error.class and SFTP connection attributes. Incomplete recursive listings are also treated as "
+        + "failures: the SFTP client logs and skips subdirectories it cannot read (read timeout, permission denied, recursion depth limit), which "
+        + "would otherwise be indistinguishable from an empty directory.")
 @SeeAlso({FetchSFTP.class, GetSFTP.class, PutSFTP.class})
 @WritesAttributes({
         @WritesAttribute(attribute = "sftp.remote.host", description = "The hostname of the SFTP Server"),
@@ -78,6 +84,9 @@ import java.util.stream.Collectors;
         @WritesAttribute(attribute = "sftp.remote.path", description = "The remote directory that was listed (also set on Failure FlowFiles)"),
         @WritesAttribute(attribute = "error.message", description = "Root-cause message when listing fails (Failure relationship)"),
         @WritesAttribute(attribute = "error.class", description = "Root-cause exception class when listing fails (Failure relationship)"),
+        @WritesAttribute(attribute = "sftp.listing.incomplete.directories",
+                description = "Number of directories that could not be listed during a recursive listing (Failure relationship)"),
+        @WritesAttribute(attribute = "record.count", description = "Number of listed files; 0 on the No Files relationship"),
         @WritesAttribute(attribute = ListFile.FILE_OWNER_ATTRIBUTE, description = "The numeric owner id of the source file"),
         @WritesAttribute(attribute = ListFile.FILE_GROUP_ATTRIBUTE, description = "The numeric group id of the source file"),
         @WritesAttribute(attribute = ListFile.FILE_PERMISSIONS_ATTRIBUTE, description = "The read/write/execute permissions of the source file"),
@@ -105,7 +114,29 @@ public class ListSFTPExtended extends ListFileTransfer {
      */
     private final ThreadLocal<Exception> listingFailure = new ThreadLocal<>();
 
+    /**
+     * Number of files returned by the last EXECUTION listing, or {@code null} when the listing never ran. Lets an
+     * empty remote directory (No Files) be told apart from a listing that found files but produced no FlowFile
+     * (Failure), without listing the remote system a second time.
+     */
+    private final ThreadLocal<Integer> executionListingCount = new ThreadLocal<>();
+
+    /**
+     * Directories that could not be listed during a recursive listing. {@code SFTPTransfer} logs and skips them
+     * instead of throwing, so without this a read timeout deep in the tree looks exactly like an empty directory.
+     * Populated through {@link #getListingLogger()}.
+     */
+    private final ThreadLocal<List<String>> incompleteListingDetails = new ThreadLocal<>();
+
     private volatile Predicate<FileInfo> fileFilter;
+
+    /** Logged by {@code SFTPTransfer} for each subdirectory it fails to list, then swallowed. */
+    private static final String DIRECTORY_LISTING_FAILURE_MESSAGE = "Unable to get listing from";
+
+    /** Logged by {@code SFTPTransfer} when it abandons recursion, which silently truncates the listing. */
+    private static final String RECURSION_LIMIT_MESSAGE = "had to stop recursively searching directories";
+
+    static final String INCOMPLETE_DIRECTORIES_ATTRIBUTE = "sftp.listing.incomplete.directories";
 
     public static final PropertyDescriptor PASSWORD = new PropertyDescriptor.Builder()
             .fromPropertyDescriptor(SFTPTransfer.PASSWORD)
@@ -236,8 +267,8 @@ public class ListSFTPExtended extends ListFileTransfer {
 
     public static final Relationship REL_NO_FILES = new Relationship.Builder()
             .name("No Files")
-            .description("A zero-record FlowFile when the listing yields no matching files after filters are applied "
-                    + "(including an empty remote directory; requires Record Writer).")
+            .description("An empty FlowFile when the listing yields no matching files after filters are applied "
+                    + "(including an empty remote directory). Zero-record content is written when a Record Writer is configured.")
             .build();
 
     @Override
@@ -269,7 +300,73 @@ public class ListSFTPExtended extends ListFileTransfer {
     @Override
     protected FileTransfer getFileTransfer(final ProcessContext context) {
         final ProcessContext wrappedContext = new FlowFileAwareProcessContext(context, triggerFlowAttributes);
-        return new SFTPTransfer(wrappedContext, getLogger());
+        return new SFTPTransfer(wrappedContext, getListingLogger());
+    }
+
+    /**
+     * Logger handed to {@link SFTPTransfer}. Behaves like {@link #getLogger()} but also records the per-directory
+     * failures that {@code SFTPTransfer} logs and swallows during a recursive listing, so a partially completed
+     * listing can be routed to {@link #REL_FAILURE} instead of being reported as an empty directory.
+     */
+    protected ComponentLog getListingLogger() {
+        final ComponentLog delegate = getLogger();
+
+        final InvocationHandler handler = (proxy, method, args) -> {
+            final String methodName = method.getName();
+            if (("error".equals(methodName) || "warn".equals(methodName))
+                    && args != null && args.length > 0 && args[0] instanceof String message
+                    && (message.contains(DIRECTORY_LISTING_FAILURE_MESSAGE) || message.contains(RECURSION_LIMIT_MESSAGE))) {
+                recordIncompleteListing(message, args);
+            }
+            return invokeUnwrapped(delegate, method, args);
+        };
+
+        return (ComponentLog) Proxy.newProxyInstance(
+                ComponentLog.class.getClassLoader(),
+                new Class<?>[] {ComponentLog.class},
+                handler);
+    }
+
+    private void recordIncompleteListing(final String message, final Object[] args) {
+        final List<String> details = incompleteListingDetails.get();
+        if (details == null) {
+            // Logged outside onTrigger (e.g. configuration verification); there is no listing to correlate it with.
+            return;
+        }
+
+        final StringBuilder detail = new StringBuilder(message);
+        appendLogArguments(detail, Arrays.copyOfRange(args, 1, args.length));
+        details.add(detail.toString());
+    }
+
+    private static void appendLogArguments(final StringBuilder detail, final Object[] args) {
+        for (final Object arg : args) {
+            if (arg instanceof Object[] nested) {
+                appendLogArguments(detail, nested);
+            } else if (arg instanceof Throwable throwable) {
+                final Throwable rootCause = getRootCause(throwable);
+                detail.append(" [")
+                        .append(rootCause.getClass().getSimpleName())
+                        .append(": ")
+                        .append(rootCause.getMessage())
+                        .append(']');
+            } else if (arg != null) {
+                detail.append(' ').append(arg);
+            }
+        }
+    }
+
+    private List<String> getIncompleteListingDetails() {
+        final List<String> details = incompleteListingDetails.get();
+        return details == null ? List.of() : details;
+    }
+
+    private static Object invokeUnwrapped(final Object target, final Method method, final Object[] args) throws Throwable {
+        try {
+            return method.invoke(target, args);
+        } catch (final InvocationTargetException e) {
+            throw e.getCause() == null ? e : e.getCause();
+        }
     }
 
     @Override
@@ -296,6 +393,23 @@ public class ListSFTPExtended extends ListFileTransfer {
     protected void customValidate(ValidationContext validationContext, Collection<ValidationResult> results) {
         SFTPTransfer.validateProxySpec(validationContext, results);
         // Note: Expression language properties are evaluated at runtime via FlowFileAwareProcessContext
+    }
+
+    /**
+     * The parent routes every listing through this overload, making it the one place where the number of listed
+     * files can be recorded even when {@link #performListing(ProcessContext, Long, ListingMode, boolean)} is
+     * overridden.
+     */
+    @Override
+    protected List<FileInfo> performListing(final ProcessContext context, final Long minTimestamp, final ListingMode listingMode)
+            throws IOException {
+        final List<FileInfo> listing = super.performListing(context, minTimestamp, listingMode);
+
+        if (listingMode == ListingMode.EXECUTION) {
+            executionListingCount.set((int) listing.stream().filter(info -> !info.isDirectory()).count());
+        }
+
+        return listing;
     }
 
     @Override
@@ -378,33 +492,135 @@ public class ListSFTPExtended extends ListFileTransfer {
             }
         }
 
+        incompleteListingDetails.set(new ArrayList<>());
+        executionListingCount.remove();
+
+        final AtomicInteger listedFlowFileCount = new AtomicInteger();
+        final ProcessSession listingSession = wrapListingSession(session, triggerFlowAttributes.get(), listedFlowFileCount);
+        final long startedNanos = System.nanoTime();
+
         try {
-            final ProcessSession listingSession = withTriggerAttributes(session, triggerFlowAttributes.get());
             // Parent may swallow listing IOExceptions (log + yield); Failure is detected via listingFailure.
             super.onTrigger(context, listingSession);
 
             final Exception listingError = listingFailure.get();
             if (listingError != null) {
-                listingFailure.remove();
-                final FlowFile errorFlowFile = createErrorFlowFile(listingSession, context, listingError);
-                if (errorFlowFile != null) {
-                    listingSession.transfer(errorFlowFile, REL_FAILURE);
-                }
+                transferErrorFlowFile(listingSession, context, listingError);
+                logListingOutcome(context, REL_FAILURE.getName(), listedFlowFileCount.get(), startedNanos);
                 return;
             }
 
-            emitEmptyFlowFileIfNeeded(context, listingSession);
+            if (listedFlowFileCount.get() > 0) {
+                if (!getIncompleteListingDetails().isEmpty()) {
+                    getLogger().warn("SFTP listing of {} returned {} FlowFile(s) but skipped {} unreadable directory(ies); "
+                                    + "files below them are not listed in this run. First skipped: {}",
+                            resolveProperty(context, REMOTE_PATH), listedFlowFileCount.get(),
+                            getIncompleteListingDetails().size(), getIncompleteListingDetails().get(0));
+                }
+                logListingOutcome(context, REL_SUCCESS.getName(), listedFlowFileCount.get(), startedNanos);
+                return;
+            }
+
+            // Nothing was transferred. The parent yields silently in several cases (empty listing, Record Writer
+            // failure, state reset failure), and the trigger FlowFile is already gone, so decide here rather than
+            // leaving the caller without an answer.
+            final Exception unexplainedEmptyListing = findEmptyListingFailure(context);
+            if (unexplainedEmptyListing != null) {
+                transferErrorFlowFile(listingSession, context, unexplainedEmptyListing);
+                logListingOutcome(context, REL_FAILURE.getName(), 0, startedNanos);
+                return;
+            }
+
+            logListingOutcome(context, transferNoFilesFlowFile(context, listingSession), 0, startedNanos);
         } catch (final Exception e) {
             getLogger().error("Failed to perform SFTP listing or handle FlowFiles due to: {}", e.getMessage(), e);
-
-            final ProcessSession listingSession = withTriggerAttributes(session, triggerFlowAttributes.get());
-            final FlowFile errorFlowFile = createErrorFlowFile(listingSession, context, e);
-            if (errorFlowFile != null) {
-                listingSession.transfer(errorFlowFile, REL_FAILURE);
-            }
+            transferErrorFlowFile(listingSession, context, e);
+            logListingOutcome(context, REL_FAILURE.getName(), listedFlowFileCount.get(), startedNanos);
         } finally {
             listingFailure.remove();
             triggerFlowAttributes.remove();
+            executionListingCount.remove();
+            incompleteListingDetails.remove();
+        }
+    }
+
+    /**
+     * Why an execution produced no FlowFile at all, or {@code null} when the remote directory genuinely held no
+     * matching file and No Files is the correct answer.
+     */
+    private Exception findEmptyListingFailure(final ProcessContext context) {
+        final List<String> incompleteDirectories = getIncompleteListingDetails();
+        if (!incompleteDirectories.isEmpty()) {
+            return new IOException(String.format(
+                    "Listing was incomplete: %d director(ies) could not be read, so an empty result cannot be trusted. "
+                            + "First failure: %s. Check remote permissions and raise Data Timeout if the tree is large.",
+                    incompleteDirectories.size(), incompleteDirectories.get(0)));
+        }
+
+        final Integer listedFiles = executionListingCount.get();
+        if (listedFiles == null) {
+            return new IOException("Listing did not run: the processor produced no FlowFile and never reached the remote "
+                    + "system. Check the preceding log entries for state or configuration errors.");
+        }
+
+        final boolean noTracking = NO_TRACKING.getValue()
+                .equals(context.getProperty(FILE_TRANSFER_LISTING_STRATEGY).getValue());
+        if (listedFiles > 0 && noTracking) {
+            return new IOException(String.format(
+                    "Listing matched %d file(s) but no listing FlowFile was produced; writing the listing failed. "
+                            + "Check the preceding 'Failed to write listing to FlowFile' log entry and the Record Writer.",
+                    listedFiles));
+        }
+
+        return null;
+    }
+
+    private void transferErrorFlowFile(final ProcessSession session, final ProcessContext context, final Exception error) {
+        listingFailure.remove();
+
+        final FlowFile errorFlowFile = createErrorFlowFile(session, context, error);
+        if (errorFlowFile != null) {
+            session.transfer(errorFlowFile, REL_FAILURE);
+        }
+    }
+
+    /**
+     * One line describing what the execution did. Only interesting per execution while troubleshooting, so it stays on
+     * DEBUG; a failed execution logs it on WARN because that is exactly when the listing context is needed.
+     */
+    private void logListingOutcome(final ProcessContext context, final String relationship,
+                                   final int flowFileCount, final long startedNanos) {
+        final boolean failed = REL_FAILURE.getName().equals(relationship);
+        if (!failed && !getLogger().isDebugEnabled()) {
+            return;
+        }
+
+        final Integer listedFiles = executionListingCount.get();
+        final String message = "SFTP listing finished: relationship={} flowFiles={} listedFiles={} "
+                + "incompleteDirectories={} host={} remotePath={} fileFilter={} pathFilter={} durationMs={}";
+        final Object[] details = {
+                relationship, flowFileCount, listedFiles == null ? "n/a" : listedFiles,
+                getIncompleteListingDetails().size(), resolveProperty(context, SFTPTransfer.HOSTNAME),
+                resolveProperty(context, REMOTE_PATH), resolveProperty(context, FILE_FILTER_REGEX),
+                resolveProperty(context, PATH_FILTER_REGEX),
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos)
+        };
+
+        if (failed) {
+            getLogger().warn(message, details);
+        } else {
+            getLogger().debug(message, details);
+        }
+    }
+
+    /** EL-resolved property value for logging and FlowFile attributes; never throws. */
+    private String resolveProperty(final ProcessContext context, final PropertyDescriptor descriptor) {
+        final Map<String, String> elAttributes = triggerFlowAttributes.get() != null ? triggerFlowAttributes.get() : Map.of();
+        try {
+            return context.getProperty(descriptor).evaluateAttributeExpressions(elAttributes).getValue();
+        } catch (final Exception e) {
+            getLogger().debug("Could not resolve {}: {}", descriptor.getName(), e.getMessage());
+            return null;
         }
     }
 
@@ -417,25 +633,27 @@ public class ListSFTPExtended extends ListFileTransfer {
         final Throwable rootCause = getRootCause(error);
         attributes.put("error.message", rootCause.getMessage() != null ? rootCause.getMessage() : error.getMessage());
         attributes.put("error.class", rootCause.getClass().getName());
-        final Map<String, String> elAttributes = triggerFlowAttributes.get() != null ? triggerFlowAttributes.get() : Map.of();
-        try {
-            attributes.put("sftp.remote.host", context.getProperty(SFTPTransfer.HOSTNAME)
-                    .evaluateAttributeExpressions(elAttributes).getValue());
-            attributes.put("sftp.remote.port", context.getProperty(SFTPTransfer.PORT)
-                    .evaluateAttributeExpressions(elAttributes).getValue());
-            attributes.put("sftp.listing.user", context.getProperty(SFTPTransfer.USERNAME)
-                    .evaluateAttributeExpressions(elAttributes).getValue());
-            attributes.put("sftp.remote.path", context.getProperty(REMOTE_PATH)
-                    .evaluateAttributeExpressions(elAttributes).getValue());
-        } catch (final Exception attrEx) {
-            getLogger().debug("Could not resolve SFTP connection attributes for error FlowFile: {}", attrEx.getMessage());
-        }
+        attributes.put(INCOMPLETE_DIRECTORIES_ATTRIBUTE, String.valueOf(getIncompleteListingDetails().size()));
+        putConnectionAttributes(attributes, context);
+        putIfResolved(attributes, "sftp.remote.path", resolveProperty(context, REMOTE_PATH));
 
         errorFlowFile = session.putAllAttributes(errorFlowFile, attributes);
 
         getLogger().debug("Created error FlowFile with attributes: {}", attributes);
 
         return errorFlowFile;
+    }
+
+    private void putConnectionAttributes(final Map<String, String> attributes, final ProcessContext context) {
+        putIfResolved(attributes, "sftp.remote.host", resolveProperty(context, SFTPTransfer.HOSTNAME));
+        putIfResolved(attributes, "sftp.remote.port", resolveProperty(context, SFTPTransfer.PORT));
+        putIfResolved(attributes, "sftp.listing.user", resolveProperty(context, SFTPTransfer.USERNAME));
+    }
+
+    private static void putIfResolved(final Map<String, String> attributes, final String name, final String value) {
+        if (value != null) {
+            attributes.put(name, value);
+        }
     }
 
     private static Throwable getRootCause(final Throwable throwable) {
@@ -453,22 +671,33 @@ public class ListSFTPExtended extends ListFileTransfer {
         }
     }
 
-    private static ProcessSession withTriggerAttributes(final ProcessSession session,
-                                                        final Map<String, String> triggerAttributes) {
-        if (triggerAttributes == null || triggerAttributes.isEmpty()) {
-            return session;
-        }
+    /**
+     * Session view used for the listing itself: it copies the trigger attributes onto every emitted FlowFile and
+     * counts what the parent transfers to {@code success}, which is how an execution that produced nothing is
+     * detected without listing the remote system again.
+     */
+    private static ProcessSession wrapListingSession(final ProcessSession session,
+                                                     final Map<String, String> triggerAttributes,
+                                                     final AtomicInteger successCount) {
+        final boolean mergeAttributes = triggerAttributes != null && !triggerAttributes.isEmpty();
 
         final InvocationHandler handler = new InvocationHandler() {
             @Override
             public Object invoke(final Object proxy, final Method method, final Object[] args) throws Throwable {
-                if ("putAllAttributes".equals(method.getName()) && args != null && args.length == 2 && args[1] instanceof Map) {
+                final String methodName = method.getName();
+
+                if (mergeAttributes && "putAllAttributes".equals(methodName)
+                        && args != null && args.length == 2 && args[1] instanceof Map) {
                     @SuppressWarnings("unchecked")
                     final Map<String, String> merged = new HashMap<>(triggerAttributes);
                     merged.putAll((Map<String, String>) args[1]);
                     args[1] = merged;
+                } else if ("transfer".equals(methodName) && args != null && args.length == 2
+                        && REL_SUCCESS.equals(args[1])) {
+                    successCount.addAndGet(args[0] instanceof Collection<?> batch ? batch.size() : 1);
                 }
-                return method.invoke(session, args);
+
+                return invokeUnwrapped(session, method, args);
             }
         };
 
@@ -478,74 +707,46 @@ public class ListSFTPExtended extends ListFileTransfer {
                 handler);
     }
 
-    private void emitEmptyFlowFileIfNeeded(final ProcessContext context,
-                                           final ProcessSession session) {
-
+    /** @return the relationship the FlowFile was routed to, for the outcome log entry. */
+    private String transferNoFilesFlowFile(final ProcessContext context, final ProcessSession session) {
         final RecordSetWriterFactory writerFactory = context.getProperty(RECORD_WRITER)
                 .asControllerService(RecordSetWriterFactory.class);
 
-        if (writerFactory == null) {
-            getLogger().debug("No Record Writer Factory configured; skipping emission when no files match.");
-            return;
-        }
-
-        try {
-            if (hasMatchingListingResults(context)) {
-                return;
-            }
-        } catch (final IOException e) {
-            getLogger().warn("Could not re-check listing for empty-state detection: {}", e.getMessage());
-            return;
-        }
-
         FlowFile emptyFlowFile = session.create();
         final Map<String, String> attributes = new HashMap<>();
-        final Map<String, String> elAttributes = triggerFlowAttributes.get() != null
-                ? triggerFlowAttributes.get()
-                : Map.of();
+        attributes.put("record.count", "0");
 
         try {
-            final RecordSchema schema = getRecordSchema();
+            if (writerFactory == null) {
+                getLogger().debug("No Record Writer configured; emitting an empty FlowFile to {} so the trigger is "
+                        + "always answered.", REL_NO_FILES.getName());
+            } else {
+                final RecordSchema schema = getRecordSchema();
 
-            emptyFlowFile = session.write(emptyFlowFile, (final OutputStream out) -> {
-                try (final RecordSetWriter writer =
-                             writerFactory.createWriter(getLogger(), schema, out, Collections.emptyMap())) {
-                    writer.beginRecordSet();
-                    final WriteResult result = writer.finishRecordSet();
-                    attributes.put("mime.type", writer.getMimeType());
-                    attributes.put("record.count", String.valueOf(result.getRecordCount()));
-                } catch (final SchemaNotFoundException snfe) {
-                    throw new IOException("Schema not found for RecordSetWriter", snfe);
-                }
-            });
+                emptyFlowFile = session.write(emptyFlowFile, (final OutputStream out) -> {
+                    try (final RecordSetWriter writer =
+                                 writerFactory.createWriter(getLogger(), schema, out, Collections.emptyMap())) {
+                        writer.beginRecordSet();
+                        final WriteResult result = writer.finishRecordSet();
+                        attributes.put("mime.type", writer.getMimeType());
+                        attributes.put("record.count", String.valueOf(result.getRecordCount()));
+                    } catch (final SchemaNotFoundException snfe) {
+                        throw new IOException("Schema not found for RecordSetWriter", snfe);
+                    }
+                });
+            }
 
-            attributes.put("sftp.remote.host",
-                    context.getProperty(SFTPTransfer.HOSTNAME)
-                            .evaluateAttributeExpressions(elAttributes).getValue());
-            attributes.put("sftp.remote.port",
-                    context.getProperty(SFTPTransfer.PORT)
-                            .evaluateAttributeExpressions(elAttributes).getValue());
-            attributes.put("sftp.listing.user",
-                    context.getProperty(SFTPTransfer.USERNAME)
-                            .evaluateAttributeExpressions(elAttributes).getValue());
-
+            putConnectionAttributes(attributes, context);
             emptyFlowFile = session.putAllAttributes(emptyFlowFile, attributes);
 
             session.transfer(emptyFlowFile, REL_NO_FILES);
-            getLogger().debug("Emitted zero-record FlowFile to No Files because no files matched the listing filters.");
+            return REL_NO_FILES.getName();
         } catch (final Exception e) {
-            getLogger().error("Failed to write empty listing FlowFile due to an error.", e);
+            getLogger().error("Failed to write the empty listing FlowFile; routing to {} instead.", REL_FAILURE.getName(), e);
             session.remove(emptyFlowFile);
+            transferErrorFlowFile(session, context, e);
+            return REL_FAILURE.getName();
         }
-    }
-
-    /**
-     * Whether the current listing configuration would yield at least one matching file entry (after file/age/size
-     * filters). Exposed as a protected method so tests can stub the remote check without contacting SFTP.
-     */
-    protected boolean hasMatchingListingResults(final ProcessContext context) throws IOException {
-        final List<FileInfo> listing = performListing(context, null, ListingMode.EXECUTION, true);
-        return listing.stream().anyMatch(info -> !info.isDirectory());
     }
 
     /**

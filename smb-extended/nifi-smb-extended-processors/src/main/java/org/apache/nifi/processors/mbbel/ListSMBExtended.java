@@ -50,6 +50,7 @@ import org.apache.nifi.services.smb.SmbListableEntity;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.lang.reflect.InvocationHandler;
+import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.lang.reflect.Proxy;
 import java.net.URI;
@@ -57,6 +58,8 @@ import java.time.Instant;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeParseException;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.Predicate;
 import java.util.regex.Pattern;
 import java.util.stream.Stream;
@@ -93,7 +96,10 @@ import static org.apache.nifi.services.smb.SmbListableEntity.SIZE;
         "Optional incoming FlowFiles can drive scheduling and Expression Language on properties. Trigger attributes are " +
         "copied onto each emitted listing FlowFile; listing attributes take precedence when names overlap. " +
         "The trigger FlowFile is removed so it is not emitted again with listing results. " +
-        "When a Record Writer is configured, a zero-record FlowFile is routed to No Files only when the remote directory has no entries.")
+        "Every trigger produces exactly one outcome: listing FlowFiles on success, an empty FlowFile on No Files when nothing matched, "
+        + "or an error FlowFile on Failure. A trigger is never consumed without a reply, so a scheduled batch cannot be left unanswered. "
+        + "When the remote listing fails (connection error, path not found, permission denied, etc.), an error FlowFile "
+        + "is routed to Failure with error.message / error.class and SMB connection attributes.")
 @WritesAttributes({
         @WritesAttribute(attribute = FILENAME, description = "The name of the file that was read from filesystem."),
         @WritesAttribute(attribute = SHORT_NAME, description = "The short name of the file that was read from filesystem."),
@@ -116,6 +122,9 @@ import static org.apache.nifi.services.smb.SmbListableEntity.SIZE;
         @WritesAttribute(attribute = SIZE, description = "The size of the file in bytes."),
         @WritesAttribute(attribute = ALLOCATION_SIZE, description = "The number of bytes allocated for the file on the server."),
         @WritesAttribute(attribute = "mime.type", description = "The MIME Type that is provided by the configured Record Writer"),
+        @WritesAttribute(attribute = "error.message", description = "Root-cause message when listing fails (Failure relationship)"),
+        @WritesAttribute(attribute = "error.class", description = "Root-cause exception class when listing fails (Failure relationship)"),
+        @WritesAttribute(attribute = "record.count", description = "Number of listed files; 0 on the No Files relationship"),
 })
 @Stateful(scopes = {Scope.CLUSTER}, description =
         "After performing a listing of files, the state of the previous listing can be stored in order to list files "
@@ -130,6 +139,13 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
     private final ThreadLocal<Map<String, String>> triggerFlowAttributes = new ThreadLocal<>();
     /** Set when {@link #performListing} fails during execution; parent swallows {@link IOException}. */
     private final ThreadLocal<Exception> listingFailure = new ThreadLocal<>();
+
+    /**
+     * Number of files returned by the last EXECUTION listing, or {@code null} when the listing never ran. Lets an
+     * empty remote directory (No Files) be told apart from a listing that found files but produced no FlowFile
+     * (Failure), without listing the remote system a second time.
+     */
+    private final ThreadLocal<Integer> executionListingCount = new ThreadLocal<>();
 
     public static final PropertyDescriptor DIRECTORY = new PropertyDescriptor.Builder()
             .name("Input Directory")
@@ -310,8 +326,8 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
 
     public static final Relationship REL_NO_FILES = new Relationship.Builder()
             .name("No Files")
-            .description("A zero-record FlowFile when the listing yields no matching files after filters are applied "
-                    + "(including an empty remote directory; requires Record Writer).")
+            .description("An empty FlowFile when the listing yields no matching files after filters are applied "
+                    + "(including an empty remote directory). Zero-record content is written when a Record Writer is configured.")
             .build();
 
     @Override
@@ -410,6 +426,11 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
                     result.add(entity);
                 }
             }
+
+            if (listingMode == ListingMode.EXECUTION) {
+                recordExecutionListingCount(result.size());
+            }
+
             return result;
         } catch (Exception e) {
             if (listingMode == ListingMode.EXECUTION) {
@@ -417,6 +438,14 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
             }
             throw new IOException("Could not perform listing", e);
         }
+    }
+
+    /**
+     * Records how many entities the EXECUTION listing returned. Protected so unit-test stubs that override
+     * {@link #performListing} can still drive the empty-vs-failure decision without a second remote listing.
+     */
+    protected void recordExecutionListingCount(final int count) {
+        executionListingCount.set(count);
     }
 
     @Override
@@ -470,40 +499,134 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
             }
         }
 
+        executionListingCount.remove();
+
+        final AtomicInteger listedFlowFileCount = new AtomicInteger();
+        final ProcessSession listingSession = wrapListingSession(session, triggerFlowAttributes.get(), listedFlowFileCount);
+        final long startedNanos = System.nanoTime();
+
         try {
             SmbjClientProviderServiceExtended.setEvaluationAttributes(triggerFlowAttributes.get());
 
             final ProcessContext listingContext = triggerFlowAttributes.get() != null
                     ? new FlowFileAwareProcessContext(context, triggerFlowAttributes)
                     : context;
-            final ProcessSession listingSession = withTriggerAttributes(session, triggerFlowAttributes.get());
-            // Parent may commitAsync mid-run; trigger FlowFile must not remain in this session (see onTrigger javadoc).
+            // Parent may swallow listing IOExceptions (log + yield); Failure is detected via listingFailure.
             super.onTrigger(listingContext, listingSession);
 
             final Exception listingError = listingFailure.get();
             if (listingError != null) {
-                listingFailure.remove();
-                final FlowFile errorFlowFile = createErrorFlowFile(listingSession, contextForErrorAttributes(context), listingError);
-                if (errorFlowFile != null) {
-                    listingSession.transfer(errorFlowFile, REL_FAILURE);
-                }
+                transferErrorFlowFile(listingSession, contextForErrorAttributes(context), listingError);
+                logListingOutcome(listingContext, REL_FAILURE.getName(), listedFlowFileCount.get(), startedNanos);
                 return;
             }
 
-            // Emit an empty FlowFile for empty directories if applicable
-            emitEmptyFlowFileIfNeeded(listingContext, listingSession);
+            if (listedFlowFileCount.get() > 0) {
+                logListingOutcome(listingContext, REL_SUCCESS.getName(), listedFlowFileCount.get(), startedNanos);
+                return;
+            }
+
+            // Nothing was transferred. The parent yields silently in several cases (empty listing, Record Writer
+            // failure, state reset failure), and the trigger FlowFile is already gone, so decide here rather than
+            // leaving the caller without an answer.
+            final Exception unexplainedEmptyListing = findEmptyListingFailure(listingContext);
+            if (unexplainedEmptyListing != null) {
+                transferErrorFlowFile(listingSession, contextForErrorAttributes(context), unexplainedEmptyListing);
+                logListingOutcome(listingContext, REL_FAILURE.getName(), 0, startedNanos);
+                return;
+            }
+
+            logListingOutcome(listingContext, transferNoFilesFlowFile(listingContext, listingSession), 0, startedNanos);
         } catch (final Exception e) {
             getLogger().error("Failed to perform SMB listing or handle FlowFiles due to: {}", e.getMessage(), e);
-
-            final ProcessSession listingSession = withTriggerAttributes(session, triggerFlowAttributes.get());
-            final FlowFile errorFlowFile = createErrorFlowFile(listingSession, contextForErrorAttributes(context), e);
-            if (errorFlowFile != null) {
-                listingSession.transfer(errorFlowFile, REL_FAILURE);
-            }
+            transferErrorFlowFile(listingSession, contextForErrorAttributes(context), e);
+            logListingOutcome(contextForErrorAttributes(context), REL_FAILURE.getName(), listedFlowFileCount.get(), startedNanos);
         } finally {
             listingFailure.remove();
             SmbjClientProviderServiceExtended.clearEvaluationAttributes();
             triggerFlowAttributes.remove();
+            executionListingCount.remove();
+        }
+    }
+
+    /**
+     * Why an execution produced no FlowFile at all, or {@code null} when the remote directory genuinely held no
+     * matching file and No Files is the correct answer.
+     */
+    private Exception findEmptyListingFailure(final ProcessContext context) {
+        final Integer listedFiles = executionListingCount.get();
+        if (listedFiles == null) {
+            return new IOException("Listing did not run: the processor produced no FlowFile and never reached the remote "
+                    + "system. Check the preceding log entries for state or configuration errors.");
+        }
+
+        final boolean noTracking = NO_TRACKING.getValue()
+                .equals(context.getProperty(SMB_LISTING_STRATEGY).getValue());
+        if (listedFiles > 0 && noTracking) {
+            return new IOException(String.format(
+                    "Listing matched %d file(s) but no listing FlowFile was produced; writing the listing failed. "
+                            + "Check the preceding 'Failed to write listing to FlowFile' log entry and the Record Writer.",
+                    listedFiles));
+        }
+
+        return null;
+    }
+
+    private void transferErrorFlowFile(final ProcessSession session, final ProcessContext context, final Exception error) {
+        listingFailure.remove();
+
+        final FlowFile errorFlowFile = createErrorFlowFile(session, context, error);
+        if (errorFlowFile != null) {
+            session.transfer(errorFlowFile, REL_FAILURE);
+        }
+    }
+
+    /**
+     * One line describing what the execution did. Only interesting per execution while troubleshooting, so it stays on
+     * DEBUG; a failed execution logs it on WARN because that is exactly when the listing context is needed.
+     */
+    private void logListingOutcome(final ProcessContext context, final String relationship,
+                                   final int flowFileCount, final long startedNanos) {
+        final boolean failed = REL_FAILURE.getName().equals(relationship);
+        if (!failed && !getLogger().isDebugEnabled()) {
+            return;
+        }
+
+        final Integer listedFiles = executionListingCount.get();
+        final String message = "SMB listing finished: relationship={} flowFiles={} listedFiles={} "
+                + "serviceLocation={} directory={} fileFilter={} pathFilter={} durationMs={}";
+        final Object[] details = {
+                relationship, flowFileCount, listedFiles == null ? "n/a" : listedFiles,
+                resolveServiceLocation(context), getDirectory(context),
+                resolveFilterProperty(context, FILE_FILTER), resolveFilterProperty(context, PATH_FILTER),
+                TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - startedNanos)
+        };
+
+        if (failed) {
+            getLogger().warn(message, details);
+        } else {
+            getLogger().debug(message, details);
+        }
+    }
+
+    private String resolveServiceLocation(final ProcessContext context) {
+        try {
+            final SmbClientProviderService clientProviderService =
+                    context.getProperty(SMB_CLIENT_PROVIDER_SERVICE).asControllerService(SmbClientProviderService.class);
+            return clientProviderService.getServiceLocation().toString();
+        } catch (final Exception e) {
+            getLogger().debug("Could not resolve SMB service location: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private String resolveFilterProperty(final ProcessContext context, final PropertyDescriptor descriptor) {
+        final Map<String, String> elAttributes = triggerFlowAttributes.get() != null ? triggerFlowAttributes.get() : Map.of();
+        try {
+            return context.getProperty(descriptor).evaluateAttributeExpressions(elAttributes).getValue();
+        } catch (final Exception e) {
+            getLogger().debug("Could not resolve {}: {}", descriptor.getName(), e.getMessage());
+            return null;
         }
     }
 
@@ -512,21 +635,24 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
                                          final Exception error) {
         FlowFile errorFlowFile = session.create();
 
-        // Add error-specific attributes
         final Map<String, String> attributes = new HashMap<>();
         final Throwable rootCause = getRootCause(error);
         attributes.put("error.message", rootCause.getMessage() != null ? rootCause.getMessage() : error.getMessage());
         attributes.put("error.class", rootCause.getClass().getName());
-        final SmbClientProviderService clientProviderService =
-                context.getProperty(SMB_CLIENT_PROVIDER_SERVICE).asControllerService(SmbClientProviderService.class);
-        attributes.put("smb.service.location", clientProviderService.getServiceLocation().toString());
-        attributes.put("smb.listing.directory", getDirectory(context));
+        putIfResolved(attributes, "smb.service.location", resolveServiceLocation(context));
+        putIfResolved(attributes, "smb.listing.directory", getDirectory(context));
 
         errorFlowFile = session.putAllAttributes(errorFlowFile, attributes);
 
         getLogger().debug("Created error FlowFile with attributes: {}", attributes);
 
         return errorFlowFile;
+    }
+
+    private static void putIfResolved(final Map<String, String> attributes, final String name, final String value) {
+        if (value != null) {
+            attributes.put(name, value);
+        }
     }
 
     private void copyTriggerAttributes(final Map<String, String> attributes) {
@@ -536,22 +662,33 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
         }
     }
 
-    private static ProcessSession withTriggerAttributes(final ProcessSession session,
-                                                        final Map<String, String> triggerAttributes) {
-        if (triggerAttributes == null || triggerAttributes.isEmpty()) {
-            return session;
-        }
+    /**
+     * Session view used for the listing itself: it copies the trigger attributes onto every emitted FlowFile and
+     * counts what the parent transfers to {@code success}, which is how an execution that produced nothing is
+     * detected without listing the remote system again.
+     */
+    private static ProcessSession wrapListingSession(final ProcessSession session,
+                                                     final Map<String, String> triggerAttributes,
+                                                     final AtomicInteger successCount) {
+        final boolean mergeAttributes = triggerAttributes != null && !triggerAttributes.isEmpty();
 
         final InvocationHandler handler = new InvocationHandler() {
             @Override
             public Object invoke(final Object proxy, final Method method, final Object[] args) throws Throwable {
-                if ("putAllAttributes".equals(method.getName()) && args != null && args.length == 2 && args[1] instanceof Map) {
+                final String methodName = method.getName();
+
+                if (mergeAttributes && "putAllAttributes".equals(methodName)
+                        && args != null && args.length == 2 && args[1] instanceof Map) {
                     @SuppressWarnings("unchecked")
                     final Map<String, String> merged = new HashMap<>(triggerAttributes);
                     merged.putAll((Map<String, String>) args[1]);
                     args[1] = merged;
+                } else if ("transfer".equals(methodName) && args != null && args.length == 2
+                        && REL_SUCCESS.equals(args[1])) {
+                    successCount.addAndGet(args[0] instanceof Collection<?> batch ? batch.size() : 1);
                 }
-                return method.invoke(session, args);
+
+                return invokeUnwrapped(session, method, args);
             }
         };
 
@@ -559,6 +696,14 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
                 ProcessSession.class.getClassLoader(),
                 new Class<?>[] {ProcessSession.class},
                 handler);
+    }
+
+    private static Object invokeUnwrapped(final Object target, final Method method, final Object[] args) throws Throwable {
+        try {
+            return method.invoke(target, args);
+        } catch (final InvocationTargetException e) {
+            throw e.getCause() == null ? e : e.getCause();
+        }
     }
 
     private ProcessContext contextForErrorAttributes(final ProcessContext context) {
@@ -575,68 +720,47 @@ public class ListSMBExtended extends AbstractListProcessor<SmbListableEntity> {
         return rootCause;
     }
 
-    private void emitEmptyFlowFileIfNeeded(final ProcessContext context,
-                                           final ProcessSession session) {
-
+    /** @return the relationship the FlowFile was routed to, for the outcome log entry. */
+    private String transferNoFilesFlowFile(final ProcessContext context, final ProcessSession session) {
         final RecordSetWriterFactory writerFactory = context.getProperty(RECORD_WRITER)
                 .asControllerService(RecordSetWriterFactory.class);
 
-        // If no writer factory, skip processing
-        if (writerFactory == null) {
-            getLogger().debug("No Record Writer Factory configured; skipping emission when no files match.");
-            return;
-        }
-
-        try {
-            if (hasMatchingListingResults(context)) {
-                return;
-            }
-        } catch (final IOException e) {
-            getLogger().warn("Could not re-check listing for empty-state detection: {}", e.getMessage());
-            return;
-        }
-
         FlowFile emptyFlowFile = session.create();
         final Map<String, String> attributes = new HashMap<>();
+        attributes.put("record.count", "0");
 
         try {
-            final RecordSchema schema = getRecordSchema();
+            if (writerFactory == null) {
+                getLogger().debug("No Record Writer configured; emitting an empty FlowFile to {} so the trigger is "
+                        + "always answered.", REL_NO_FILES.getName());
+            } else {
+                final RecordSchema schema = getRecordSchema();
 
-            emptyFlowFile = session.write(emptyFlowFile, (final OutputStream out) -> {
-                try (final RecordSetWriter writer =
-                             writerFactory.createWriter(getLogger(), schema, out, Collections.emptyMap())) {
-                    writer.beginRecordSet();
-                    final WriteResult result = writer.finishRecordSet();
-                    attributes.put("mime.type", writer.getMimeType());
-                    attributes.put("record.count", String.valueOf(result.getRecordCount()));
-                } catch (final SchemaNotFoundException snfe) {
-                    throw new IOException("Schema not found for RecordSetWriter", snfe);
-                }
-            });
+                emptyFlowFile = session.write(emptyFlowFile, (final OutputStream out) -> {
+                    try (final RecordSetWriter writer =
+                                 writerFactory.createWriter(getLogger(), schema, out, Collections.emptyMap())) {
+                        writer.beginRecordSet();
+                        final WriteResult result = writer.finishRecordSet();
+                        attributes.put("mime.type", writer.getMimeType());
+                        attributes.put("record.count", String.valueOf(result.getRecordCount()));
+                    } catch (final SchemaNotFoundException snfe) {
+                        throw new IOException("Schema not found for RecordSetWriter", snfe);
+                    }
+                });
+            }
 
-            // Populate attributes for logging/debugging
-            final SmbClientProviderService clientProviderService =
-                    context.getProperty(SMB_CLIENT_PROVIDER_SERVICE).asControllerService(SmbClientProviderService.class);
-            attributes.put("smb.service.location", clientProviderService.getServiceLocation().toString());
-            attributes.put("smb.listing.directory", getDirectory(context));
-
+            putIfResolved(attributes, "smb.service.location", resolveServiceLocation(context));
+            putIfResolved(attributes, "smb.listing.directory", getDirectory(context));
             emptyFlowFile = session.putAllAttributes(emptyFlowFile, attributes);
 
             session.transfer(emptyFlowFile, REL_NO_FILES);
-            getLogger().debug("Emitted zero-record FlowFile to No Files because no files matched the listing filters.");
+            return REL_NO_FILES.getName();
         } catch (final Exception e) {
-            getLogger().error("Failed to write empty listing FlowFile due to an error.", e);
+            getLogger().error("Failed to write the empty listing FlowFile; routing to {} instead.", REL_FAILURE.getName(), e);
             session.remove(emptyFlowFile);
+            transferErrorFlowFile(session, context, e);
+            return REL_FAILURE.getName();
         }
-    }
-
-    /**
-     * Whether the current listing configuration would yield at least one matching file (after file/path/age/size
-     * filters). Exposed as a protected method so tests can stub the remote check without contacting SMB.
-     */
-    protected boolean hasMatchingListingResults(final ProcessContext context) throws IOException {
-        final List<SmbListableEntity> listing = performListing(context, null, ListingMode.EXECUTION);
-        return listing != null && !listing.isEmpty();
     }
 
     private String formatTimeStamp(long timestamp) {

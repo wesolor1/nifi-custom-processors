@@ -6,6 +6,7 @@ import org.apache.nifi.controller.AbstractControllerService;
 import org.apache.nifi.expression.ExpressionLanguageScope;
 import org.apache.nifi.logging.ComponentLog;
 import org.apache.nifi.processor.ProcessContext;
+import org.apache.nifi.processor.ProcessSession;
 import org.apache.nifi.processor.util.list.AbstractListProcessor;
 import org.apache.nifi.serialization.RecordSetWriter;
 import org.apache.nifi.serialization.RecordSetWriterFactory;
@@ -41,6 +42,9 @@ public class ListSMBExtendedTest {
         @Override
         protected List<SmbListableEntity> performListing(final ProcessContext context, final Long minimumTimestampOrNull,
                                                         final org.apache.nifi.processor.util.list.AbstractListProcessor.ListingMode listingMode) throws IOException {
+            if (listingMode == ListingMode.EXECUTION) {
+                recordExecutionListingCount(0);
+            }
             return Collections.emptyList();
         }
     }
@@ -55,6 +59,9 @@ public class ListSMBExtendedTest {
         @Override
         protected List<SmbListableEntity> performListing(final ProcessContext context, final Long minimumTimestampOrNull,
                                                         final org.apache.nifi.processor.util.list.AbstractListProcessor.ListingMode listingMode) throws IOException {
+            if (listingMode == ListingMode.EXECUTION) {
+                recordExecutionListingCount(0);
+            }
             return Collections.emptyList();
         }
     }
@@ -105,7 +112,22 @@ public class ListSMBExtendedTest {
                     .setChangeTime(System.currentTimeMillis() - 60_000L)
                     .setServiceLocation(URI.create("smb://localhost:445/share"))
                     .build();
+            if (listingMode == ListingMode.EXECUTION) {
+                recordExecutionListingCount(1);
+            }
             return List.of(entity);
+        }
+    }
+
+    /**
+     * Listing succeeds but no FlowFile is produced, which is what the parent {@code AbstractListProcessor} does when
+     * the Record Writer or the state update fails: it logs and yields.
+     */
+    private static class SilentlyYieldingSmb extends SingleFileListingSmb {
+        @Override
+        public void listByNoTracking(final ProcessContext context, final ProcessSession session) {
+            performListing(context, 0L, ListingMode.EXECUTION);
+            context.yield();
         }
     }
 
@@ -125,13 +147,20 @@ public class ListSMBExtendedTest {
         @Override
         public RecordSetWriter createWriter(ComponentLog logger, RecordSchema schema, OutputStream out, Map<String, String> variables) {
             return new RecordSetWriter() {
+                private int recordCount;
+
                 @Override
                 public WriteResult write(org.apache.nifi.serialization.record.Record record) throws IOException {
-                    throw new UnsupportedOperationException();
+                    recordCount++;
+                    return WriteResult.of(recordCount, Collections.emptyMap());
                 }
 
                 @Override
                 public WriteResult write(org.apache.nifi.serialization.record.RecordSet recordSet) throws IOException {
+                    org.apache.nifi.serialization.record.Record record;
+                    while ((record = recordSet.next()) != null) {
+                        write(record);
+                    }
                     return finishRecordSet();
                 }
 
@@ -140,7 +169,7 @@ public class ListSMBExtendedTest {
 
                 @Override
                 public WriteResult finishRecordSet() throws IOException {
-                    return WriteResult.of(0, Collections.emptyMap());
+                    return WriteResult.of(recordCount, Collections.emptyMap());
                 }
 
                 @Override
@@ -367,7 +396,7 @@ public class ListSMBExtendedTest {
     }
 
     @Test
-    public void testTriggerFlowFileIsRemovedFromSession() throws Exception {
+    public void testTriggerFlowFileIsRemovedAndAnsweredWithoutRecordWriter() throws Exception {
         final TestRunner runner = newRunner(new EmptyListingSmb());
 
         runner.enqueue("trigger", Map.of("batch.id", "B4"));
@@ -375,8 +404,52 @@ public class ListSMBExtendedTest {
 
         runner.assertQueueEmpty();
         runner.assertTransferCount(ListSMBExtended.REL_SUCCESS, 0);
-        runner.assertTransferCount(ListSMBExtended.REL_NO_FILES, 0);
         runner.assertTransferCount(ListSMBExtended.REL_FAILURE, 0);
+        runner.assertTransferCount(ListSMBExtended.REL_NO_FILES, 1);
+
+        final MockFlowFile emitted = runner.getFlowFilesForRelationship(ListSMBExtended.REL_NO_FILES).get(0);
+        emitted.assertAttributeEquals("batch.id", "B4");
+        emitted.assertAttributeEquals("record.count", "0");
+    }
+
+    @Test
+    public void testListedFilesWithoutFlowFileRouteToFailure() throws Exception {
+        final TestRunner runner = newRunner(new SilentlyYieldingSmb());
+        registerWriter(runner);
+
+        runner.enqueue("trigger", Map.of("batch.id", "B-nowrite"));
+        runner.run(1);
+
+        runner.assertTransferCount(ListSMBExtended.REL_FAILURE, 1);
+        runner.assertTransferCount(ListSMBExtended.REL_NO_FILES, 0);
+        runner.assertTransferCount(ListSMBExtended.REL_SUCCESS, 0);
+
+        final MockFlowFile failure = runner.getFlowFilesForRelationship(ListSMBExtended.REL_FAILURE).get(0);
+        failure.assertAttributeEquals("batch.id", "B-nowrite");
+        assertTrue(failure.getAttribute("error.message").contains("Listing matched 1 file(s)"),
+                "error.message should report the listed file count, was: " + failure.getAttribute("error.message"));
+    }
+
+    @Test
+    public void testEveryTriggerProducesExactlyOneOutcome() throws Exception {
+        final List<ListSMBExtended> processors = List.of(
+                new EmptyListingSmb(), new FilterExcludedListingSmb(), new SingleFileListingSmb(),
+                new SilentlyYieldingSmb(), new ExceptionListingSmb());
+
+        for (final ListSMBExtended processor : processors) {
+            final TestRunner runner = newRunner(processor);
+            registerWriter(runner);
+
+            runner.enqueue("trigger", Map.of("batch.id", "B-" + processor.getClass().getSimpleName()));
+            runner.run(1);
+
+            final int emitted = runner.getFlowFilesForRelationship(ListSMBExtended.REL_SUCCESS).size()
+                    + runner.getFlowFilesForRelationship(ListSMBExtended.REL_NO_FILES).size()
+                    + runner.getFlowFilesForRelationship(ListSMBExtended.REL_FAILURE).size();
+
+            assertEquals(1, emitted, processor.getClass().getSimpleName()
+                    + " must answer the trigger with exactly one FlowFile");
+            runner.assertQueueEmpty();
+        }
     }
 }
-
