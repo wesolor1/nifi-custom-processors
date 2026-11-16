@@ -22,6 +22,7 @@ import org.apache.nifi.annotation.behavior.SupportsBatching;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.SeeAlso;
 import org.apache.nifi.annotation.documentation.Tags;
+import org.apache.nifi.annotation.lifecycle.OnStopped;
 import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processor.ProcessSession;
@@ -41,7 +42,8 @@ import java.util.Map;
  * {@link AWSCredentialsProviderControllerServiceExtended}. Incoming FlowFile attributes are published so Access Key ID
  * and Secret Access Key configured with Expression Language (for example {@code ${source_access_key_id}}) are evaluated
  * against those attributes. The credentials provider re-resolves on each SDK request so a cached S3 client still picks
- * up per-FlowFile credentials.
+ * up per-FlowFile credentials. Clients themselves are cached per region and Endpoint Override URL, so two FlowFiles
+ * with different endpoints do not share one client.
  */
 @SupportsBatching
 @InputRequirement(Requirement.INPUT_REQUIRED)
@@ -62,6 +64,12 @@ public class PutS3ObjectExtended extends PutS3Object {
      */
     private final ThreadLocal<Map<String, String>> triggerFlowAttributes = new ThreadLocal<>();
 
+    /**
+     * One S3 client per region + endpoint. Stock {@code AbstractAwsProcessor} keys only by region, which pins the
+     * first FlowFile's endpoint until the processor is stopped.
+     */
+    private final S3EndpointClientCache endpointClients = new S3EndpointClientCache();
+
     @Override
     protected List<PropertyDescriptor> getSupportedPropertyDescriptors() {
         return S3FlowFileEndpointSupport.withFlowFileEndpoint(super.getSupportedPropertyDescriptors());
@@ -73,6 +81,12 @@ public class PutS3ObjectExtended extends PutS3Object {
      */
     @Override
     public void onScheduled(final ProcessContext context) {
+        endpointClients.close();
+    }
+
+    @OnStopped
+    public void closeEndpointClients() {
+        endpointClients.close();
     }
 
     @Override
@@ -92,7 +106,8 @@ public class PutS3ObjectExtended extends PutS3Object {
     @Override
     protected S3Client getClient(final ProcessContext context, final Map<String, String> attributes) {
         captureTriggerAttributes(attributes);
-        return super.getClient(context, attributes);
+        // createClient (not super.getClient) skips the region-only cache in AbstractAwsProcessor.
+        return endpointClients.get(context, attributes, () -> createClient(context, attributes));
     }
 
     @Override

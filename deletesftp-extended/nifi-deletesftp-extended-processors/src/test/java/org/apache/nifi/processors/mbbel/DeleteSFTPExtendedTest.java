@@ -22,10 +22,14 @@ import org.apache.nifi.components.PropertyDescriptor;
 import org.apache.nifi.processor.ProcessContext;
 import org.apache.nifi.processors.standard.DeleteSFTP;
 import org.apache.nifi.processors.standard.util.SFTPTransfer;
+import org.apache.nifi.util.MockFlowFile;
 import org.apache.nifi.util.TestRunner;
 import org.apache.nifi.util.TestRunners;
 import org.junit.jupiter.api.Test;
 
+import java.io.FileNotFoundException;
+import java.io.IOException;
+import java.net.ServerSocket;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -133,5 +137,93 @@ public class DeleteSFTPExtendedTest {
                 .evaluateAttributeExpressions(attributes).getValue());
         assertNull(sanitized.getProperty(SFTPTransfer.PRIVATE_KEY_PATH)
                 .evaluateAttributeExpressions(attributes).getValue());
+    }
+
+    @Test
+    public void testNotFoundMessageNamesFileAndDirectory() {
+        assertEquals(
+                "Filename 'example.txt' not found in directory '/incoming'",
+                DeleteSFTPExtended.notFoundMessage("example.txt", "/incoming"));
+    }
+
+    @Test
+    public void testNotFoundMessageNamesDirectoryWhenRemovingADirectory() {
+        assertEquals(
+                "Directory '/incoming' not found",
+                DeleteSFTPExtended.notFoundMessage(null, "/incoming"));
+    }
+
+    @Test
+    public void testNotFoundMessageKeepsUnderlyingSftpDetail() {
+        final FileNotFoundException missing = new FileNotFoundException("No such file");
+
+        assertEquals(
+                "Filename 'example.txt' not found in directory '/incoming': No such file",
+                DeleteSFTPExtended.formatErrorMessage(
+                        DeleteSFTPExtended.notFoundMessage("example.txt", "/incoming"), missing));
+    }
+
+    @Test
+    public void testErrorMessageIncludesCauseChain() {
+        final IOException failure = new IOException("Failed to delete [/incoming/report.csv]",
+                new IOException("3: Permission denied"));
+
+        assertEquals(
+                "Failed to delete file 'report.csv' in directory '/incoming': "
+                        + "Failed to delete [/incoming/report.csv]: 3: Permission denied",
+                DeleteSFTPExtended.formatErrorMessage(
+                        "Failed to delete file 'report.csv' in directory '/incoming'", failure));
+    }
+
+    @Test
+    public void testFailureSetsErrorMessageWhenFilenameIsNotInDirectory() {
+        final TestRunner runner = TestRunners.newTestRunner(new DeleteSFTPExtended());
+        runner.setProperty(SFTPTransfer.HOSTNAME, "127.0.0.1");
+        runner.setProperty(SFTPTransfer.USERNAME, "user");
+        runner.setProperty(DeleteSFTPExtended.PASSWORD, "secret");
+        runner.setProperty(DeleteSFTP.DIRECTORY_PATH, "/incoming");
+        runner.setProperty(DeleteSFTP.FILENAME, "nested/report.csv");
+
+        runner.enqueue("payload");
+        runner.run();
+
+        runner.assertTransferCount(DeleteSFTP.REL_FAILURE, 1);
+        runner.assertTransferCount(DeleteSFTP.REL_SUCCESS, 0);
+        runner.assertTransferCount(DeleteSFTP.REL_NOT_FOUND, 0);
+        final MockFlowFile failure = runner.getFlowFilesForRelationship(DeleteSFTP.REL_FAILURE).get(0);
+        final String errorMessage = failure.getAttribute(DeleteSFTPExtended.ERROR_MESSAGE_ATTRIBUTE);
+        assertNotNull(errorMessage);
+        assertTrue(errorMessage.contains("report.csv"), errorMessage);
+        assertTrue(errorMessage.contains("not a direct child"), errorMessage);
+    }
+
+    @Test
+    public void testFailureSetsErrorMessageWhenDeleteCannotConnect() throws IOException {
+        final int closedPort;
+        try (ServerSocket socket = new ServerSocket(0)) {
+            closedPort = socket.getLocalPort();
+        }
+
+        final TestRunner runner = TestRunners.newTestRunner(new DeleteSFTPExtended());
+        runner.setProperty(SFTPTransfer.HOSTNAME, "127.0.0.1");
+        runner.setProperty(SFTPTransfer.PORT, Integer.toString(closedPort));
+        runner.setProperty(SFTPTransfer.USERNAME, "user");
+        runner.setProperty(DeleteSFTPExtended.PASSWORD, "secret");
+        runner.setProperty(SFTPTransfer.CONNECTION_TIMEOUT, "3 sec");
+        runner.setProperty(SFTPTransfer.DATA_TIMEOUT, "3 sec");
+        runner.setProperty(DeleteSFTP.DIRECTORY_PATH, "/incoming");
+        runner.setProperty(DeleteSFTP.FILENAME, "report.csv");
+
+        runner.enqueue("payload");
+        runner.run();
+
+        runner.assertTransferCount(DeleteSFTP.REL_FAILURE, 1);
+        runner.assertTransferCount(DeleteSFTP.REL_SUCCESS, 0);
+        final MockFlowFile failure = runner.getFlowFilesForRelationship(DeleteSFTP.REL_FAILURE).get(0);
+        final String errorMessage = failure.getAttribute(DeleteSFTPExtended.ERROR_MESSAGE_ATTRIBUTE);
+        assertNotNull(errorMessage);
+        assertTrue(errorMessage.contains("report.csv"), errorMessage);
+        assertTrue(errorMessage.contains("/incoming"), errorMessage);
+        assertTrue(errorMessage.toLowerCase().contains("connection refused"), errorMessage);
     }
 }

@@ -299,11 +299,17 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
     }
 
     /**
+     * One S3 client per region + endpoint. Stock {@code AbstractAwsProcessor} keys only by region.
+     */
+    private final S3EndpointClientCache endpointClients = new S3EndpointClientCache();
+
+    /**
      * Skip {@link AbstractAwsProcessor}'s eager S3 client. Endpoint Override and credentials may be FlowFile
      * Expression Language and are only known when a trigger FlowFile arrives.
      */
     @Override
     public void onScheduled(final ProcessContext context) {
+        endpointClients.close();
     }
 
     @OnScheduled
@@ -313,6 +319,7 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
 
     @OnStopped
     public void onStoppedListingEngine() {
+        endpointClients.close();
         invokeHierarchyLifecycle(OnStopped.class);
     }
 
@@ -436,7 +443,7 @@ public class ListS3Extended extends AbstractS3Processor implements VerifiablePro
         if (attributes != null && !attributes.isEmpty()) {
             triggerFlowAttributes.set(attributes);
         }
-        return super.getClient(context, attributes);
+        return endpointClients.get(context, attributes, () -> createClient(context, attributes));
     }
 
     @Override

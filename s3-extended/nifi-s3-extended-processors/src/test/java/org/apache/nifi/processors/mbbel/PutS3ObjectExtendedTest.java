@@ -37,15 +37,20 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.AwsCredentials;
+import software.amazon.awssdk.services.s3.S3Client;
 
 import java.lang.reflect.Field;
+import java.lang.reflect.Proxy;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertNotSame;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertSame;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class PutS3ObjectExtendedTest {
@@ -165,6 +170,49 @@ public class PutS3ObjectExtendedTest {
         final AwsBasicCredentials credentials = (AwsBasicCredentials) processor.resolvedCredentials;
         assertEquals("resolved-access-key", credentials.accessKeyId());
         assertEquals("resolved-secret-key", credentials.secretAccessKey());
+    }
+
+    @Test
+    public void testClientsAreCachedPerEndpointOverride() throws InitializationException {
+        final PutS3ObjectExtended processor = new PutS3ObjectExtended();
+        final TestRunner runner = newRunner(processor);
+        runner.setProperty(S3FlowFileEndpointSupport.ENDPOINT_OVERRIDE, "${target_endpoint_override}");
+
+        final var context = runner.getProcessContext();
+        final Map<String, String> hpcA = Map.of("target_endpoint_override", "https://s3-a.example:443");
+        final Map<String, String> hpcAAgain = Map.of(
+                "target_endpoint_override", "https://s3-a.example:443",
+                "target_username", "other-key");
+        final Map<String, String> hpcB = Map.of("target_endpoint_override", "https://s3-b.example:443");
+
+        assertEquals("us-east-1\u0000https://s3-a.example:443", S3EndpointClientCache.cacheKey(context, hpcA));
+        assertEquals(S3EndpointClientCache.cacheKey(context, hpcA), S3EndpointClientCache.cacheKey(context, hpcAAgain));
+        assertEquals("us-east-1\u0000https://s3-b.example:443", S3EndpointClientCache.cacheKey(context, hpcB));
+
+        final S3EndpointClientCache cache = new S3EndpointClientCache();
+        final AtomicInteger builds = new AtomicInteger();
+        final S3Client first = cache.get(context, hpcA, () -> client(builds));
+        final S3Client sameEndpoint = cache.get(context, hpcAAgain, () -> client(builds));
+        final S3Client otherEndpoint = cache.get(context, hpcB, () -> client(builds));
+
+        assertSame(first, sameEndpoint, "Same endpoint must reuse one S3 client");
+        assertNotSame(first, otherEndpoint, "A second endpoint must not reuse the first client");
+        assertEquals(2, builds.get(), "Each distinct endpoint is built once");
+        cache.close();
+        assertEquals(0, cache.size());
+    }
+
+    private static S3Client client(final AtomicInteger builds) {
+        builds.incrementAndGet();
+        return (S3Client) Proxy.newProxyInstance(
+                S3Client.class.getClassLoader(),
+                new Class<?>[] {S3Client.class},
+                (proxy, method, args) -> {
+                    if ("close".equals(method.getName()) || "serviceName".equals(method.getName())) {
+                        return "close".equals(method.getName()) ? null : "s3";
+                    }
+                    return null;
+                });
     }
 
     @Test
