@@ -32,6 +32,8 @@ import org.apache.nifi.annotation.behavior.InputRequirement;
 import org.apache.nifi.annotation.behavior.InputRequirement.Requirement;
 import org.apache.nifi.annotation.behavior.ReadsAttribute;
 import org.apache.nifi.annotation.behavior.ReadsAttributes;
+import org.apache.nifi.annotation.behavior.WritesAttribute;
+import org.apache.nifi.annotation.behavior.WritesAttributes;
 import org.apache.nifi.annotation.documentation.CapabilityDescription;
 import org.apache.nifi.annotation.documentation.Tags;
 import org.apache.nifi.annotation.lifecycle.OnScheduled;
@@ -79,9 +81,15 @@ import static org.apache.nifi.smb.common.SmbUtils.buildSmbClient;
         + "Configure the Hostname, Share and Directory accordingly: \\\\[Hostname]\\[Share]\\[path\\to\\Directory]. "
         + "This is an extended variant of PutSmbFile whose Password property is not marked sensitive and "
         + "whose Username and Password properties support Expression Language against FlowFile attributes, "
-        + "allowing credentials to be injected dynamically.")
+        + "allowing credentials to be injected dynamically. "
+        + "When a write fails, the FlowFile is routed to failure with an error.message attribute describing what happened.")
 @ReadsAttributes({@ReadsAttribute(attribute = "filename", description = "The filename to use when writing the FlowFile to the network folder.")})
+@WritesAttributes({
+        @WritesAttribute(attribute = PutSMBFileExtended.ERROR_MESSAGE_ATTRIBUTE,
+                description = "Why the write failed, including the destination and the underlying error when one is available. Written when the FlowFile is routed to failure.")
+})
 public class PutSMBFileExtended extends AbstractProcessor {
+    public static final String ERROR_MESSAGE_ATTRIBUTE = "error.message";
     public static final String SHARE_ACCESS_NONE = "none";
     public static final String SHARE_ACCESS_READ = "read";
     public static final String SHARE_ACCESS_READDELETE = "read, delete";
@@ -180,7 +188,8 @@ public class PutSMBFileExtended extends AbstractProcessor {
 
     public static final Relationship REL_FAILURE = new Relationship.Builder()
             .name("failure")
-            .description("Files that could not be written to the output network path for some reason are transferred to this relationship")
+            .description("Files that could not be written to the output network path for some reason are transferred to this relationship. "
+                    + "The FlowFile has an error.message attribute describing what happened.")
             .build();
 
     private static final List<PropertyDescriptor> PROPERTY_DESCRIPTORS = List.of(
@@ -344,17 +353,17 @@ public class PutSMBFileExtended extends AbstractProcessor {
                     final String destinationFileParentDirectory = new java.io.File(destinationFullPath).getParent();
                     final Boolean createMissingDirectories = context.getProperty(CREATE_DIRS).asBoolean();
                     if (!createMissingDirectories && !share.folderExists(destinationFileParentDirectory)) {
-                        logger.warn("Penalizing {} and routing to failure as configured because the destination directory ({}) doesn't exist", flowFile, destinationFileParentDirectory);
-                        flowFile = session.penalize(flowFile);
-                        session.transfer(flowFile, REL_FAILURE);
+                        routeFailure(session, flowFile,
+                                "Destination directory '" + destinationFileParentDirectory + "' does not exist on \\\\" + hostname + "\\" + shareName,
+                                null);
                         continue;
                     } else if (!share.folderExists(destinationFileParentDirectory)) {
                         try {
                             createMissingDirectoriesRecursively(logger, share, destinationFileParentDirectory);
                         } catch (Exception e) {
-                            logger.error("Penalizing {} and routing to failure because failed to create missing destination directories ({})", flowFile, destinationFileParentDirectory, e);
-                            flowFile = session.penalize(flowFile);
-                            session.transfer(flowFile, REL_FAILURE);
+                            routeFailure(session, flowFile,
+                                    "Failed to create destination directory '" + destinationFileParentDirectory + "' on \\\\" + hostname + "\\" + shareName,
+                                    e);
                             continue;
                         }
                     }
@@ -367,9 +376,10 @@ public class PutSMBFileExtended extends AbstractProcessor {
                             session.transfer(flowFile, REL_SUCCESS);
                             continue;
                         } else if (conflictResolution.equals(FAIL_RESOLUTION)) {
-                            logger.warn("Penalizing {} and routing to failure as configured because file with the same name already exists", flowFile);
-                            flowFile = session.penalize(flowFile);
-                            session.transfer(flowFile, REL_FAILURE);
+                            routeFailure(session, flowFile,
+                                    "File '" + destinationFullPath + "' already exists on \\\\" + hostname + "\\" + shareName
+                                            + " and conflict resolution is fail",
+                                    null);
                             continue;
                         }
                     }
@@ -394,9 +404,9 @@ public class PutSMBFileExtended extends AbstractProcessor {
                             OutputStream shareDestinationFileOutputStream = shareDestinationFile.getOutputStream()) {
                         session.exportTo(flowFile, shareDestinationFileOutputStream);
                     } catch (Exception e) {
-                        logger.error("Cannot transfer the file. Penalizing {} and routing to 'failure'", flowFile, e);
-                        flowFile = session.penalize(flowFile);
-                        session.transfer(flowFile, REL_FAILURE);
+                        routeFailure(session, flowFile,
+                                "Cannot write file '" + finalDestinationFullPath + "' on \\\\" + hostname + "\\" + shareName,
+                                e);
                         continue;
                     }
 
@@ -416,9 +426,10 @@ public class PutSMBFileExtended extends AbstractProcessor {
                             // rename the file on the share and replace it in case it exists
                             fileDiskEntry.rename(destinationFullPath, true);
                         } catch (Exception e) {
-                            logger.error("Cannot rename the file. Penalizing {} and routing to 'failure'", flowFile, e);
-                            flowFile = session.penalize(flowFile);
-                            session.transfer(flowFile, REL_FAILURE);
+                            routeFailure(session, flowFile,
+                                    "Cannot rename temporary file '" + finalDestinationFullPath + "' to '" + destinationFullPath
+                                            + "' on \\\\" + hostname + "\\" + shareName,
+                                    e);
                             continue;
                         }
                     }
@@ -430,15 +441,81 @@ public class PutSMBFileExtended extends AbstractProcessor {
                     session.getProvenanceReporter().send(flowFile, provenanceUri.toString(), processingTimeInMilli);
                     session.transfer(flowFile, REL_SUCCESS);
                 } catch (Exception e) {
-                    logger.error("Error processing flowfile {}", flowFile, e);
-                    flowFile = session.penalize(flowFile);
-                    session.transfer(flowFile, REL_FAILURE);
+                    final String filename = flowFile.getAttribute(CoreAttributes.FILENAME.key());
+                    routeFailure(session, flowFile,
+                            "Error writing file '" + filename + "' to \\\\" + hostname + "\\" + shareName,
+                            e);
                 }
             }
         } catch (Exception e) {
-            logger.error("Could not establish smb connection", e);
-            session.transfer(flowFiles, REL_FAILURE);
+            routeFailure(session, flowFiles,
+                    "Could not establish SMB connection to \\\\" + hostname + "\\" + shareName,
+                    e);
             smbClient.getServerList().unregister(hostname);
         }
+    }
+
+    private void routeFailure(final ProcessSession session, final FlowFile flowFile, final String summary, final Throwable throwable) {
+        final String errorMessage = formatErrorMessage(summary, throwable);
+        if (throwable == null) {
+            getLogger().warn("Penalizing {} and routing to failure: {}", flowFile, errorMessage);
+        } else {
+            getLogger().error("Penalizing {} and routing to failure: {}", flowFile, errorMessage, throwable);
+        }
+        final FlowFile failed = session.putAttribute(session.penalize(flowFile), ERROR_MESSAGE_ATTRIBUTE, errorMessage);
+        session.transfer(failed, REL_FAILURE);
+    }
+
+    private void routeFailure(final ProcessSession session, final List<FlowFile> flowFiles, final String summary, final Throwable throwable) {
+        final String errorMessage = formatErrorMessage(summary, throwable);
+        getLogger().error(errorMessage, throwable);
+        final List<FlowFile> failed = new ArrayList<>(flowFiles.size());
+        for (final FlowFile flowFile : flowFiles) {
+            failed.add(session.putAttribute(flowFile, ERROR_MESSAGE_ATTRIBUTE, errorMessage));
+        }
+        session.transfer(failed, REL_FAILURE);
+    }
+
+    static String formatErrorMessage(final String summary, final Throwable throwable) {
+        if (throwable == null) {
+            return summary;
+        }
+        final String detail = throwableDetail(throwable);
+        if (detail.isEmpty()) {
+            return summary + ": " + throwable.getClass().getSimpleName();
+        }
+        if (summary.endsWith(detail)) {
+            return summary;
+        }
+        return summary + ": " + detail;
+    }
+
+    private static String throwableDetail(final Throwable throwable) {
+        final StringBuilder detail = new StringBuilder();
+        Throwable current = throwable;
+        int guard = 0;
+        while (current != null && guard++ < 10) {
+            appendMessage(detail, current.getMessage());
+            final Throwable cause = current.getCause();
+            if (cause == current) {
+                break;
+            }
+            current = cause;
+        }
+        return detail.toString();
+    }
+
+    private static void appendMessage(final StringBuilder detail, final String message) {
+        if (message == null || message.isBlank()) {
+            return;
+        }
+        final String trimmed = message.trim();
+        if (detail.indexOf(trimmed) >= 0) {
+            return;
+        }
+        if (detail.length() > 0) {
+            detail.append(": ");
+        }
+        detail.append(trimmed);
     }
 }
